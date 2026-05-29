@@ -22,6 +22,80 @@ pip install setuptools==59.5.0
 ```
 
 ## Usage
+### Clean RGB workflow used in this repo
+Use this when starting from `data/annotations/rgb_keypoints.json`.
+
+```bash
+python make_rgb_train_test_split.py
+```
+
+This creates a non-overlapping split under `datasets/keypoints/coco_format/`:
+
+```
+train_imgs/  + annotations/train.json   # model training
+val_imgs/    + annotations/val.json     # validation during training
+test_imgs/   + annotations/test.json    # final holdout evaluation
+demo_imgs/   + annotations/demo.json    # demo/inference examples
+```
+
+The split script keeps source folder identity in the copied image names, for example
+`rgb/25/00001.jpg` becomes `rgb_25_00001.jpg`. This prevents different source
+folders with the same frame name from overwriting each other or leaking across
+splits.
+
+After splitting, sanity-check annotations:
+
+```bash
+python visualize_data.py --config-file configs/CattleKeypoints/keypoints_rcnn_R_50_FPN.yaml --dataset-name keypoints_demo --output-dir data/outtest/viz_demo_check --source annotation
+```
+
+Then train. The default config trains on `keypoints_train` and validates on
+`keypoints_val`.
+
+### Temperature estimation workflow
+The keypoint models are only the first part of the CattleFever-style pipeline.
+For rectal/internal temperature estimation, first audit which metadata rows have
+both `temperature_f` and raw thermal TIFF frames:
+
+```bash
+python temperature_model/audit_temperature_data.py
+```
+
+Then train the current raw-TIFF baseline:
+
+```bash
+python temperature_model/train_raw_baseline.py --max-frames 80 --output-dir data/temperature_outputs/raw_baseline_v1
+```
+
+For the fuller CattleFever-style path, extract detected keypoint ROI features
+from raw TIFFs and train a Random Forest regressor:
+
+```bash
+python temperature_model/make_paired_rgb_thermal_split.py
+python temperature_model/extract_detected_roi_features.py --max-frames 30 --output-dir data/temperature_outputs/detected_roi_v1
+python temperature_model/train_temperature_regressor.py --features data/temperature_outputs/detected_roi_v1/features.csv --output-dir data/temperature_outputs/detected_roi_v1
+python temperature_model/combine_features.py --left data/temperature_outputs/raw_baseline_v1/features.csv --right data/temperature_outputs/detected_roi_v1/features.csv --output data/temperature_outputs/combined_v1/features.csv
+python temperature_model/train_temperature_regressor.py --features data/temperature_outputs/combined_v1/features.csv --output-dir data/temperature_outputs/combined_v1
+```
+
+This writes:
+
+```
+data/temperature_outputs/*/
+  features.csv
+  metrics.json
+  predictions.csv
+  feature_importance.csv
+  split.json
+  temperature_random_forest.joblib
+```
+
+The raw baseline uses whole-frame TIFF statistics. The detected-ROI workflow is
+closer to the CattleFever article: it runs the trained thermal keypoint detector
+on sampled raw TIFF frames, scales predicted face landmarks back to the raw
+thermal resolution, and extracts temperatures from specific facial regions such
+as the muzzle, nostrils, mouth, and eyes.
+
 ### 1. Visualize datasets
 ```bash
 python visualize_data.py --dataset-name keypoints_train --output-dir data/outtest/viz_back_kp_test/ --source annotation 

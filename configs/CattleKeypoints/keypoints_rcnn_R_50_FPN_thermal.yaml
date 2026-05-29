@@ -1,0 +1,26 @@
+_BASE_: "../Base-RCNN-FPN.yaml"
+MODEL:
+  # Start thermal training from ImageNet-pretrained R50 unless continuing from a prior thermal checkpoint.
+  RESNETS:
+    DEPTH: 50
+  KEYPOINT_ON: True
+  ROI_HEADS:
+    NUM_CLASSES: 1
+    SCORE_THRESH_TEST: 0.0
+  ROI_BOX_HEAD:
+    SMOOTH_L1_BETA: 0.5
+  ROI_KEYPOINT_HEAD:
+    NUM_KEYPOINTS: 13
+  RPN:
+    POST_NMS_TOPK_TRAIN: 1500
+
+DATASETS:
+  TRAIN: ("thermal_keypoints_train",)
+  TEST: ("thermal_keypoints_val",)
+TEST:
+  KEYPOINT_OKS_SIGMAS: [0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8]
+OUTPUT_DIR: data/train_outputs/thermal_clean_v1/
+SOLVER:
+  BASE_LR: 0.001
+  IMS_PER_BATCH: 2
+  CHECKPOINT_PERIOD: 1000

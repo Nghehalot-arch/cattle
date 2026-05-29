@@ -19,7 +19,7 @@ MODEL:
     
 DATASETS:
   TRAIN: ("keypoints_train",)
-  TEST: ("keypoints_test",)
+  TEST: ("keypoints_val",)
 TEST:
   KEYPOINT_OKS_SIGMAS: [0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8,0.8] # length of list should be equal to num of keypoints
 OUTPUT_DIR: data/train_outputs/test/
