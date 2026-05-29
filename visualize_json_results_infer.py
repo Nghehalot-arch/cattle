@@ -83,6 +83,8 @@ if __name__ == "__main__":
         img = cv2.imread(dic["file_name"], cv2.IMREAD_COLOR)[:, :, ::-1]
         basename = os.path.basename(dic["file_name"])
 
+        if len(pred_by_image[dic["image_id"]]) == 0:
+            continue
         predictions = create_instances(pred_by_image[dic["image_id"]], img.shape[:2])
         vis = Visualizer(img, metadata)
         vis_pred = vis.draw_instance_predictions(predictions).get_image()
