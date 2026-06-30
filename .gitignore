@@ -1,11 +1,17 @@
 *pyc
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
 scripts/
 test.json
 train.json
 d2cattle/
 *.jpg
 data*
+thermal_raw/
 *.json
 *.zip
 *.mp4
 *.pth
+vendor/
+test.md

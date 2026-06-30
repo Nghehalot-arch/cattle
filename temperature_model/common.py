@@ -2,10 +2,18 @@ import csv
 import json
 import math
 import re
+import sys
 import zipfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
+
+SKLEARN_COMPAT = Path(__file__).resolve().parent / "_sklearn_compat"
+VENDOR = Path(__file__).resolve().parents[1] / "vendor" / "python38"
+if VENDOR.exists():
+    sys.path.insert(0, str(VENDOR))
+if SKLEARN_COMPAT.exists():
+    sys.path.insert(0, str(SKLEARN_COMPAT))
 
 import cv2
 import joblib

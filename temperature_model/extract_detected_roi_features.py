@@ -5,14 +5,11 @@ import zipfile
 from pathlib import Path
 
 import numpy as np
-from detectron2.config import get_cfg
-from detectron2.engine import DefaultPredictor
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import register_cattle_datasets  # noqa: F401
 from common import (
     aggregate_feature_rows,
     choose_evenly_spaced,
@@ -45,8 +42,20 @@ QUALITY_KEYPOINTS = [
     "mouth",
 ]
 
+ALL_KEYPOINT_INDEX = {f"kp{index + 1:02d}": index for index in range(13)}
+
 
 def setup_predictor(config_file, weights, threshold):
+    try:
+        from detectron2.config import get_cfg
+        from detectron2.engine import DefaultPredictor
+        import register_cattle_datasets  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Detectron2 is required to run keypoint detection. "
+            "Use an environment with Detectron2 installed, or predict from an already extracted features.csv."
+        ) from exc
+
     cfg = get_cfg()
     cfg.merge_from_file(str(config_file))
     cfg.MODEL.WEIGHTS = str(weights)
@@ -92,7 +101,47 @@ def add_keypoint_circle(features, array, keypoints, name, radius, min_keypoint_s
     features.update(prefixed_stats(name, circle_values(array, (x, y), radius)))
 
 
-def roi_features(array, bbox, keypoints, min_keypoint_score):
+def add_indexed_keypoint_circle(features, array, keypoints, name, index, radius, min_keypoint_score):
+    x, y, score = keypoints[index]
+    if score < min_keypoint_score:
+        return
+    features.update(prefixed_stats(name, circle_values(array, (x, y), radius)))
+
+
+def rect_ring_values(array, inner_rect, margin_x, margin_y):
+    height, width = array.shape
+    x0, y0, x1, y1 = inner_rect
+    outer = (
+        x0 - margin_x,
+        y0 - margin_y,
+        x1 + margin_x,
+        y1 + margin_y,
+    )
+    ix0 = max(0, min(width - 1, int(round(x0))))
+    iy0 = max(0, min(height - 1, int(round(y0))))
+    ix1 = max(ix0 + 1, min(width, int(round(x1))))
+    iy1 = max(iy0 + 1, min(height, int(round(y1))))
+    ox0 = max(0, min(width - 1, int(round(outer[0]))))
+    oy0 = max(0, min(height - 1, int(round(outer[1]))))
+    ox1 = max(ox0 + 1, min(width, int(round(outer[2]))))
+    oy1 = max(oy0 + 1, min(height, int(round(outer[3]))))
+    patch = array[oy0:oy1, ox0:ox1]
+    if patch.size == 0:
+        return np.asarray([], dtype=np.float32)
+    yy, xx = np.ogrid[oy0:oy1, ox0:ox1]
+    inner_mask = (xx >= ix0) & (xx < ix1) & (yy >= iy0) & (yy < iy1)
+    values = patch[~inner_mask]
+    return values.reshape(-1)
+
+
+def roi_features(
+    array,
+    bbox,
+    keypoints,
+    min_keypoint_score,
+    include_all_keypoints=False,
+    include_surrounding_ring=False,
+):
     features = {}
     x0, y0, x1, y1 = bbox
     face_w = max(1.0, x1 - x0)
@@ -100,9 +149,19 @@ def roi_features(array, bbox, keypoints, min_keypoint_score):
     radius = max(2.0, min(face_w, face_h) * 0.045)
 
     features.update(prefixed_stats("face_bbox", rect_values(array, bbox)))
+    if include_surrounding_ring:
+        features.update(
+            prefixed_stats(
+                "face_surround",
+                rect_ring_values(array, bbox, face_w * 0.30, face_h * 0.30),
+            )
+        )
 
     for name in KEYPOINT_INDEX:
         add_keypoint_circle(features, array, keypoints, name, radius, min_keypoint_score)
+    if include_all_keypoints:
+        for name, index in ALL_KEYPOINT_INDEX.items():
+            add_indexed_keypoint_circle(features, array, keypoints, name, index, radius, min_keypoint_score)
 
     nostril_points = []
     for name in ("left_nostril", "right_nostril"):
@@ -229,6 +288,33 @@ def passes_quality_filter(quality, args):
     return all(checks)
 
 
+def roi_coordinate_record(row, frame_id, bbox, keypoints, quality):
+    record = {
+        "date": row["date"],
+        "sequence_num": row["sequence_num"],
+        "cow_tag": row.get("cow_tag", ""),
+        "temperature_f": row.get("temperature_f", ""),
+        "frame_id": frame_id,
+        "bbox_x0": float(bbox[0]),
+        "bbox_y0": float(bbox[1]),
+        "bbox_x1": float(bbox[2]),
+        "bbox_y1": float(bbox[3]),
+    }
+    for name, value in quality.items():
+        record[f"quality_{name}"] = value
+    for name, index in KEYPOINT_INDEX.items():
+        x, y, score = keypoints[index]
+        record[f"kp_{name}_x"] = float(x)
+        record[f"kp_{name}_y"] = float(y)
+        record[f"kp_{name}_score"] = float(score)
+    for name, index in ALL_KEYPOINT_INDEX.items():
+        x, y, score = keypoints[index]
+        record[f"{name}_x"] = float(x)
+        record[f"{name}_y"] = float(y)
+        record[f"{name}_score"] = float(score)
+    return record
+
+
 def extract_features(args):
     metadata_rows = load_temperature_metadata(args.metadata)
     raw_index = index_raw_zip(args.raw_zip)
@@ -237,6 +323,7 @@ def extract_features(args):
     sequence_records = []
     frame_feature_records = []
     frame_records = []
+    frame_coordinate_records = []
     skipped_unreadable = 0
     skipped_no_detection = 0
     skipped_quality = 0
@@ -273,7 +360,14 @@ def extract_features(args):
                     skipped_quality += 1
                     continue
 
-                features = roi_features(array, bbox, keypoints, args.min_keypoint_score)
+                features = roi_features(
+                    array,
+                    bbox,
+                    keypoints,
+                    args.min_keypoint_score,
+                    include_all_keypoints=args.include_all_keypoints,
+                    include_surrounding_ring=args.include_surrounding_ring,
+                )
                 if not features:
                     continue
                 if args.include_quality_features:
@@ -301,6 +395,8 @@ def extract_features(args):
                         **quality,
                     }
                 )
+                if args.write_roi_coordinates:
+                    frame_coordinate_records.append(roi_coordinate_record(row, frame_id, bbox, keypoints, quality))
 
             if not per_frame_features:
                 continue
@@ -323,6 +419,8 @@ def extract_features(args):
         write_csv(args.output_dir / "frame_features.csv", frame_feature_records)
     if frame_records:
         write_csv(args.output_dir / "frame_detections.csv", frame_records)
+    if frame_coordinate_records:
+        write_csv(args.output_dir / "frame_roi_coordinates.csv", frame_coordinate_records)
 
     summary = {
         "sequence_count": len(sequence_records),
@@ -366,6 +464,9 @@ def main():
     parser.add_argument("--max-muzzle-symmetry", default=0.55, type=float)
     parser.add_argument("--min-frontal-score", default=0.25, type=float)
     parser.add_argument("--require-lower-face-order", action="store_true")
+    parser.add_argument("--write-roi-coordinates", action="store_true")
+    parser.add_argument("--include-all-keypoints", action="store_true")
+    parser.add_argument("--include-surrounding-ring", action="store_true")
     args = parser.parse_args()
 
     summary = extract_features(args)

@@ -33,6 +33,37 @@ are assigned to the same split:
 & $py temperature_model\make_paired_rgb_thermal_split.py
 ```
 
+Create grouped 5-fold RGB/thermal manifests for fold-by-fold training. Each fold
+has its own `train`, `val`, and `test` pair CSVs plus RGB and thermal COCO JSONs.
+By default this does not duplicate image files; the manifests point back to the
+original image paths:
+
+```powershell
+& $py temperature_model\make_paired_rgb_thermal_folds.py
+```
+
+Audit/evaluate the 5-fold manifests. This trains one paired RGB/thermal
+image-stat baseline per fold only when that fold has enough labeled train and
+test rows; otherwise it writes the reason the fold was skipped:
+
+```powershell
+& $py temperature_model\run_paired_rgb_thermal_folds.py
+```
+
+Create consolidated performance and output-temperature tables from the paired
+fold audit and the valid locked ROI evaluations:
+
+```powershell
+& $py temperature_model\summarize_temperature_performance.py
+```
+
+Create a focused table listing the eight missing labeled videos and every
+paired/sequence/cow/date fold with its held-out groups and metrics:
+
+```powershell
+& $py temperature_model\create_fold_results_tables.py
+```
+
 Visualize paired RGB/thermal samples side by side for manual checking:
 
 ```powershell
@@ -152,6 +183,7 @@ Using the available local data:
 usable temperature sequences: 21
 paired RGB/thermal samples: 1286
 paired split: 900 train, 192 val, 128 test, 66 demo
+paired 5-fold manifests: 1286 samples across 5 grouped folds
 RGB/thermal/raw-temperature triples: 50 frame rows
 detected ROI sampled frames: 609
 unreadable raw TIFF samples skipped: 21
@@ -261,3 +293,10 @@ pipelines: only 50 frame-level rows link RGB, processed thermal, raw TIFF, and a
 rectal temperature label in this local copy, and they currently come from one
 temperature sequence. That is useful for manual verification, but not enough for
 training a meaningful three-modal temperature regressor.
+
+The grouped 5-fold RGB/thermal manifests are written to
+`datasets/keypoints/paired_rgb_thermal_5fold`. They are ready for keypoint or
+paired-modality experiments, but only 209 paired rows currently have a usable
+rectal-temperature label, all from folder `1`. More labeled RGB/thermal folders
+are needed before the 5-fold paired set can support meaningful temperature
+accuracy comparisons.
