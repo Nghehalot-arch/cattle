@@ -24,6 +24,9 @@ import numpy as np
 ID_COLUMNS = {"date", "sequence_num", "cow_tag", "temperature_f"}
 DEFAULT_MODEL_DIR = Path("data/temperature_outputs/detected_article_otsu_fusion_ridge_k20_v1")
 DEFAULT_FEATURES = Path("data/temperature_outputs/detected_article_otsu_fusion_v1/features.csv")
+DEFAULT_RAW_ZIP = Path("data/thermal_raw.zip")
+DEFAULT_FUSION_MODEL_DIR = Path("data/temperature_outputs/deployment_fusion_cnn_article_otsu_top10_full_v1")
+DEFAULT_FUSION_METRICS_DIR = Path("data/temperature_outputs/thermal_feature_fusion_cnn_article_otsu_top10_grouped_v1")
 
 
 def parse_value(name: str, value: str) -> object:
@@ -77,9 +80,18 @@ def json_safe(value: object) -> object:
 
 
 class TemperatureService:
-    def __init__(self, model_dir: Path, features_csv: Path, model_name: str = "model_full.joblib"):
+    def __init__(
+        self,
+        model_dir: Path,
+        features_csv: Path,
+        model_name: str = "model_full.joblib",
+        raw_zip: Path = DEFAULT_RAW_ZIP,
+        fusion_model_dir: Path | None = None,
+        fusion_metrics_dir: Path | None = None,
+    ):
         self.model_dir = model_dir
         self.features_csv = features_csv
+        self.raw_zip = raw_zip
         self.model = joblib.load(model_dir / model_name)
         with (model_dir / "feature_schema.json").open("r", encoding="utf-8") as f:
             self.schema = json.load(f)
@@ -89,25 +101,55 @@ class TemperatureService:
         self.rows = read_feature_rows(features_csv)
         self.rows_by_key = {(str(row["date"]), str(row["sequence_num"])): row for row in self.rows}
         self.selected_features = read_csv_rows(model_dir / "selected_features_full.csv")
+        self.fusion_model_dir = fusion_model_dir if fusion_model_dir and fusion_model_dir.exists() else None
+        self.fusion_metrics_dir = fusion_metrics_dir if fusion_metrics_dir and fusion_metrics_dir.exists() else None
+        self.fusion_metrics = None
+        self.fusion_feature_names: list[str] = []
+        if self.fusion_metrics_dir:
+            with (self.fusion_metrics_dir / "metrics.json").open("r", encoding="utf-8") as f:
+                self.fusion_metrics = json.load(f)
+        if self.fusion_model_dir:
+            import torch
+
+            checkpoint = torch.load(
+                self.fusion_model_dir / "thermal_feature_fusion_cnn.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+            self.fusion_feature_names = list(checkpoint["state"]["feature_names"])
+
+    def primary_metrics(self) -> dict[str, object]:
+        return self.fusion_metrics or self.metrics
+
+    def primary_holdout_metrics(self) -> dict[str, object]:
+        metrics = self.primary_metrics()
+        holdout = metrics.get("holdout", {})
+        if isinstance(holdout, dict) and "metrics" in holdout:
+            return holdout["metrics"]
+        return holdout if isinstance(holdout, dict) else {}
 
     def model_info(self) -> dict[str, object]:
+        metrics = self.primary_metrics()
         validation = {
             row["grouping"]: {
                 "mae": row["mae_mean"],
                 "rmse": row["rmse_mean"],
             }
-            for row in self.metrics.get("validation", [])
+            for row in metrics.get("validation", [])
         }
+        holdout = self.primary_holdout_metrics()
+        selected_count = len(self.fusion_feature_names) if self.fusion_model_dir else self.metrics.get("selected_feature_count")
         return {
-            "model_dir": str(self.model_dir),
+            "model_dir": str(self.fusion_model_dir or self.model_dir),
+            "classical_model_dir": str(self.model_dir),
             "features_csv": str(self.features_csv),
-            "model": self.metrics.get("model", self.schema.get("model_name", "")),
-            "selected_feature_count": self.metrics.get("selected_feature_count"),
-            "feature_count": self.metrics.get("feature_count"),
-            "sample_count": self.metrics.get("sample_count"),
-            "holdout": self.metrics.get("holdout", {}),
+            "model": "fusion_cnn_article_otsu_top10" if self.fusion_model_dir else self.metrics.get("model", self.schema.get("model_name", "")),
+            "selected_feature_count": selected_count,
+            "feature_count": metrics.get("feature_count", selected_count),
+            "sample_count": metrics.get("sample_count", metrics.get("usable_labeled_videos")),
+            "holdout": holdout,
             "validation": validation,
-            "holdout_test_videos": self.metrics.get("holdout_test_videos", []),
+            "holdout_test_videos": metrics.get("holdout_test_videos", metrics.get("holdout", {}).get("test_videos", [])),
         }
 
     def sequences(self) -> list[dict[str, object]]:
@@ -132,8 +174,31 @@ class TemperatureService:
             raise KeyError(f"No feature row found for {date}/{sequence_num}")
         row = self.rows_by_key[key]
         x = np.asarray([[row.get(name, np.nan) for name in self.feature_names]], dtype=np.float32)
-        prediction = float(self.model.predict(x)[0])
-        holdout_rmse = finite_float(self.metrics.get("holdout", {}).get("rmse")) or 1.0
+        classical_prediction = float(self.model.predict(x)[0])
+        prediction = classical_prediction
+        prediction_source = "classical_roi"
+        comparison_predictions = [
+            {
+                "model": self.metrics.get("model", "classical_roi"),
+                "prediction_f": classical_prediction,
+            }
+        ]
+        if self.fusion_model_dir:
+            from predict_temperature_system import fusion_prediction
+
+            prediction = float(fusion_prediction(self.fusion_model_dir, self.raw_zip, date, sequence_num, row))
+            prediction_source = "fusion_cnn_article_otsu_top10"
+            comparison_predictions.append(
+                {
+                    "model": prediction_source,
+                    "prediction_f": prediction,
+                }
+            )
+
+        holdout_rmse = finite_float(self.primary_holdout_metrics().get("rmse"))
+        if holdout_rmse is None:
+            sequence_validation = self.model_info().get("validation", {}).get("sequence", {})
+            holdout_rmse = finite_float(sequence_validation.get("rmse")) or 1.0
         z = (prediction - threshold_f) / max(holdout_rmse, 1e-6)
         probability = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
         if probability >= 0.67:
@@ -145,23 +210,37 @@ class TemperatureService:
 
         truth = finite_float(row.get("temperature_f"))
         selected = []
-        for item in self.selected_features[:30]:
-            feature = item.get("feature", "")
-            selected.append(
-                {
-                    "rank": int(float(item.get("rank", 0) or 0)),
-                    "feature": feature,
-                    "value": row.get(feature),
-                    "f_score": finite_float(item.get("f_score")),
-                    "model_importance": finite_float(item.get("model_importance")),
-                }
-            )
+        if self.fusion_feature_names:
+            for rank, feature in enumerate(self.fusion_feature_names[:30], start=1):
+                selected.append(
+                    {
+                        "rank": rank,
+                        "feature": feature,
+                        "value": row.get(feature),
+                        "f_score": None,
+                        "model_importance": None,
+                    }
+                )
+        else:
+            for item in self.selected_features[:30]:
+                feature = item.get("feature", "")
+                selected.append(
+                    {
+                        "rank": int(float(item.get("rank", 0) or 0)),
+                        "feature": feature,
+                        "value": row.get(feature),
+                        "f_score": finite_float(item.get("f_score")),
+                        "model_importance": finite_float(item.get("model_importance")),
+                    }
+                )
 
         result = {
             "date": date,
             "sequence_num": sequence_num,
             "cow_tag": row.get("cow_tag", ""),
             "prediction_f": prediction,
+            "prediction_source": prediction_source,
+            "comparison_predictions": comparison_predictions,
             "threshold_f": threshold_f,
             "expected_error_rmse_f": holdout_rmse,
             "fever_probability_research": probability,
@@ -388,7 +467,7 @@ HTML = r"""<!doctype html>
       <label>Date<select id="dateSelect"></select></label>
       <label>Sequence<select id="sequenceSelect"></select></label>
       <label>Threshold F<input id="thresholdInput" type="number" step="0.1" value="103.5" /></label>
-      <label>Model<select id="modelSelect"><option>fusion ridge k20</option></select></label>
+      <label>Model<select id="modelSelect"><option>loading</option></select></label>
       <button id="predictButton">Predict</button>
     </section>
 
@@ -455,6 +534,7 @@ HTML = r"""<!doctype html>
 
     function renderModel(info) {
       modelStatus.textContent = `${info.model} | ${info.sample_count} sequences | ${info.selected_feature_count}/${info.feature_count} features`;
+      modelSelect.innerHTML = `<option>${info.model}</option>`;
       const rows = [
         ["holdout", info.holdout?.mae, info.holdout?.rmse],
         ["sequence", info.validation?.sequence?.mae, info.validation?.sequence?.rmse],
@@ -605,11 +685,22 @@ def main() -> None:
     parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR, type=Path)
     parser.add_argument("--features-csv", default=DEFAULT_FEATURES, type=Path)
     parser.add_argument("--model-name", default="model_full.joblib")
+    parser.add_argument("--raw-zip", default=DEFAULT_RAW_ZIP, type=Path)
+    parser.add_argument("--fusion-model-dir", default=DEFAULT_FUSION_MODEL_DIR, type=Path)
+    parser.add_argument("--fusion-metrics-dir", default=DEFAULT_FUSION_METRICS_DIR, type=Path)
+    parser.add_argument("--no-fusion-model", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
     args = parser.parse_args()
 
-    TemperatureHandler.service = TemperatureService(args.model_dir, args.features_csv, args.model_name)
+    TemperatureHandler.service = TemperatureService(
+        args.model_dir,
+        args.features_csv,
+        args.model_name,
+        raw_zip=args.raw_zip,
+        fusion_model_dir=None if args.no_fusion_model else args.fusion_model_dir,
+        fusion_metrics_dir=None if args.no_fusion_model else args.fusion_metrics_dir,
+    )
     server = ThreadingHTTPServer((args.host, args.port), TemperatureHandler)
     print(f"Serving cattle temperature UI at http://{args.host}:{args.port}")
     server.serve_forever()

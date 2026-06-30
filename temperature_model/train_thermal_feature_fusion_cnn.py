@@ -446,6 +446,7 @@ def main():
     parser.add_argument("--raw-zip", default="data/thermal_raw.zip", type=Path)
     parser.add_argument("--features", default="data/temperature_outputs/detected_roi_filtered_80_v1/features.csv", type=Path)
     parser.add_argument("--selected-features", type=Path)
+    parser.add_argument("--feature-limit", type=int)
     parser.add_argument("--anchor-model", type=Path)
     parser.add_argument("--anchor-schema", type=Path)
     parser.add_argument("--anchor-feature-name", default="roi_anchor_prediction")
@@ -494,6 +495,8 @@ def main():
         if not train_samples or not test_samples:
             raise RuntimeError("Split did not match samples.")
     feature_names = read_selected_features(args.selected_features, feature_rows)
+    if args.feature_limit:
+        feature_names = feature_names[: args.feature_limit]
     if args.anchor_model and args.anchor_feature_name not in feature_names:
         feature_names.append(args.anchor_feature_name)
 
