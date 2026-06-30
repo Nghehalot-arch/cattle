@@ -45,7 +45,7 @@ QUALITY_KEYPOINTS = [
 ALL_KEYPOINT_INDEX = {f"kp{index + 1:02d}": index for index in range(13)}
 
 
-def setup_predictor(config_file, weights, threshold):
+def setup_predictor(config_file, weights, threshold, device=None):
     try:
         from detectron2.config import get_cfg
         from detectron2.engine import DefaultPredictor
@@ -60,6 +60,8 @@ def setup_predictor(config_file, weights, threshold):
     cfg.merge_from_file(str(config_file))
     cfg.MODEL.WEIGHTS = str(weights)
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = threshold
+    if device:
+        cfg.MODEL.DEVICE = device
     cfg.freeze()
     return DefaultPredictor(cfg)
 

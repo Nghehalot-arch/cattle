@@ -15,12 +15,16 @@ if SKLEARN_COMPAT.exists():
 
 import joblib
 import numpy as np
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, RandomForestRegressor
 from sklearn.feature_selection import SelectKBest, f_regression
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import GroupKFold
+from sklearn.neighbors import KNeighborsRegressor
 from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVR
 
 from common import ID_COLUMNS, read_feature_csv, write_csv
 
@@ -46,17 +50,32 @@ def metric_dict(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     return result
 
 
-def make_model(select_k: int, seed: int):
-    return make_pipeline(
-        SimpleImputer(strategy="median"),
-        SelectKBest(score_func=f_regression, k=select_k),
-        GradientBoostingRegressor(
+def make_model(model_name: str, select_k: int, seed: int):
+    selector = SelectKBest(score_func=f_regression, k=select_k)
+    if model_name == "random_forest":
+        estimator = RandomForestRegressor(n_estimators=500, random_state=seed, min_samples_leaf=1)
+        return make_pipeline(SimpleImputer(strategy="median"), selector, estimator)
+    if model_name == "extra_trees":
+        estimator = ExtraTreesRegressor(n_estimators=500, random_state=seed, min_samples_leaf=1)
+        return make_pipeline(SimpleImputer(strategy="median"), selector, estimator)
+    if model_name == "gradient_boosting":
+        estimator = GradientBoostingRegressor(
             random_state=seed,
             n_estimators=300,
             learning_rate=0.03,
             max_depth=2,
-        ),
-    )
+        )
+        return make_pipeline(SimpleImputer(strategy="median"), selector, estimator)
+    if model_name == "svr_rbf":
+        estimator = SVR(C=10.0, epsilon=0.05, gamma="scale")
+        return make_pipeline(SimpleImputer(strategy="median"), selector, StandardScaler(), estimator)
+    if model_name == "ridge":
+        estimator = Ridge(alpha=1.0)
+        return make_pipeline(SimpleImputer(strategy="median"), selector, StandardScaler(), estimator)
+    if model_name == "knn":
+        estimator = KNeighborsRegressor(n_neighbors=5, weights="distance")
+        return make_pipeline(SimpleImputer(strategy="median"), selector, StandardScaler(), estimator)
+    raise ValueError(f"Unknown model: {model_name}")
 
 
 def build_matrix(records: list[dict[str, object]], feature_names: list[str]) -> tuple[np.ndarray, np.ndarray]:
@@ -70,13 +89,19 @@ def build_matrix(records: list[dict[str, object]], feature_names: list[str]) -> 
 
 def selected_feature_rows(model, feature_names: list[str]) -> list[dict[str, object]]:
     selector = model.named_steps["selectkbest"]
-    regressor = model.named_steps["gradientboostingregressor"]
+    estimator = list(model.named_steps.values())[-1]
     mask = selector.get_support()
     selected = [name for name, keep in zip(feature_names, mask) if keep]
     scores = selector.scores_
+    if hasattr(estimator, "feature_importances_"):
+        model_importances = np.asarray(estimator.feature_importances_, dtype=float)
+    elif hasattr(estimator, "coef_"):
+        model_importances = np.abs(np.ravel(estimator.coef_).astype(float))
+    else:
+        model_importances = np.zeros(len(selected), dtype=float)
     rows = []
     for rank, (feature, importance) in enumerate(
-        sorted(zip(selected, regressor.feature_importances_), key=lambda item: item[1], reverse=True),
+        sorted(zip(selected, model_importances), key=lambda item: item[1], reverse=True),
         start=1,
     ):
         feature_index = feature_names.index(feature)
@@ -121,6 +146,7 @@ def grouped_cv(
     feature_names: list[str],
     group_name: str,
     groups: np.ndarray,
+    model_name: str,
     select_k: int,
     seed: int,
     output_dir: Path,
@@ -134,7 +160,7 @@ def grouped_cv(
     prediction_rows = []
     cv = GroupKFold(n_splits=n_splits)
     for fold, (train_idx, test_idx) in enumerate(cv.split(x, y, groups), start=1):
-        model = make_model(min(select_k, len(feature_names)), seed + fold)
+        model = make_model(model_name, min(select_k, len(feature_names)), seed + fold)
         model.fit(x[train_idx], y[train_idx])
         pred = model.predict(x[test_idx])
         metrics = metric_dict(y[test_idx], pred)
@@ -182,6 +208,11 @@ def main() -> None:
     parser.add_argument("--split-metrics", default="data/temperature_outputs/thermal_cnn_absolute_quick_lr1e3_v1/metrics.json", type=Path)
     parser.add_argument("--output-dir", default="data/temperature_outputs/best_roi_gradient_boosting_v1", type=Path)
     parser.add_argument("--select-k", default=10, type=int)
+    parser.add_argument(
+        "--model",
+        default="gradient_boosting",
+        choices=["random_forest", "extra_trees", "gradient_boosting", "svr_rbf", "ridge", "knn"],
+    )
     parser.add_argument("--seed", default=1337, type=int)
     args = parser.parse_args()
 
@@ -199,7 +230,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     select_k = min(args.select_k, len(feature_names))
 
-    holdout_model = make_model(select_k, args.seed)
+    holdout_model = make_model(args.model, select_k, args.seed)
     holdout_model.fit(x[train_idx], y[train_idx])
     holdout_pred = holdout_model.predict(x[test_idx])
     holdout_metrics = metric_dict(y[test_idx], holdout_pred)
@@ -208,7 +239,7 @@ def main() -> None:
     holdout_selected = selected_feature_rows(holdout_model, feature_names)
     write_csv(args.output_dir / "selected_features_holdout.csv", holdout_selected)
 
-    full_model = make_model(select_k, args.seed)
+    full_model = make_model(args.model, select_k, args.seed)
     full_model.fit(x, y)
     joblib.dump(full_model, args.output_dir / "model_full.joblib")
     full_selected = selected_feature_rows(full_model, feature_names)
@@ -221,7 +252,18 @@ def main() -> None:
         "date": np.asarray([str(record["date"]) for record in records]),
     }
     for group_name, groups in group_sets.items():
-        summary = grouped_cv(records, x, y, feature_names, group_name, groups, select_k, args.seed, args.output_dir)
+        summary = grouped_cv(
+            records,
+            x,
+            y,
+            feature_names,
+            group_name,
+            groups,
+            args.model,
+            select_k,
+            args.seed,
+            args.output_dir,
+        )
         if summary:
             validation.append(summary)
     write_csv(args.output_dir / "validation_summary.csv", validation)
@@ -231,13 +273,9 @@ def main() -> None:
         "feature_names": feature_names,
         "id_columns": sorted(ID_COLUMNS),
         "selected_feature_count": select_k,
-        "model_type": "GradientBoostingRegressor",
-        "model_params": {
-            "n_estimators": 300,
-            "learning_rate": 0.03,
-            "max_depth": 2,
-            "random_state": args.seed,
-        },
+        "model_name": args.model,
+        "model_type": type(list(full_model.named_steps.values())[-1]).__name__,
+        "model_params": list(full_model.named_steps.values())[-1].get_params(),
     }
     with (args.output_dir / "feature_schema.json").open("w", encoding="utf-8") as f:
         json.dump(schema, f, indent=2)
@@ -246,6 +284,7 @@ def main() -> None:
         "sample_count": len(records),
         "feature_count": len(feature_names),
         "selected_feature_count": select_k,
+        "model": args.model,
         "split_metrics": str(args.split_metrics),
         "holdout_train_videos": sorted(set(keys[train_idx])),
         "holdout_test_videos": sorted(set(keys[test_idx])),
