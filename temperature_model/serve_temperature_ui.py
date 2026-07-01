@@ -26,7 +26,15 @@ DEFAULT_MODEL_DIR = Path("data/temperature_outputs/detected_article_otsu_fusion_
 DEFAULT_FEATURES = Path("data/temperature_outputs/detected_article_otsu_fusion_v1/features.csv")
 DEFAULT_RAW_ZIP = Path("data/thermal_raw.zip")
 DEFAULT_FUSION_MODEL_DIR = Path("data/temperature_outputs/deployment_fusion_cnn_article_otsu_top10_qualityframes_full_v1")
-DEFAULT_FUSION_METRICS_DIR = Path("data/temperature_outputs/thermal_feature_fusion_cnn_article_otsu_top10_qualityframes_grouped_v1")
+DEFAULT_FUSION_MODEL_DIRS = [
+    DEFAULT_FUSION_MODEL_DIR,
+    Path("data/temperature_outputs/deployment_fusion_cnn_article_otsu_top10_qualityframes_seed42_full_v1"),
+    Path("data/temperature_outputs/deployment_fusion_cnn_article_otsu_top10_qualityframes_seed2026_full_v1"),
+    Path("data/temperature_outputs/deployment_fusion_cnn_article_otsu_top10_qualityframes_seed7_full_v1"),
+]
+DEFAULT_FUSION_METRICS_DIR = Path(
+    "data/temperature_outputs/thermal_feature_fusion_cnn_article_otsu_top10_qualityframes_seed_ensemble_equal_v1"
+)
 
 
 def parse_value(name: str, value: str) -> object:
@@ -87,6 +95,8 @@ class TemperatureService:
         model_name: str = "model_full.joblib",
         raw_zip: Path = DEFAULT_RAW_ZIP,
         fusion_model_dir: Path | None = None,
+        fusion_model_dirs: list[Path] | None = None,
+        fusion_weights: list[float] | None = None,
         fusion_metrics_dir: Path | None = None,
     ):
         self.model_dir = model_dir
@@ -101,18 +111,34 @@ class TemperatureService:
         self.rows = read_feature_rows(features_csv)
         self.rows_by_key = {(str(row["date"]), str(row["sequence_num"])): row for row in self.rows}
         self.selected_features = read_csv_rows(model_dir / "selected_features_full.csv")
-        self.fusion_model_dir = fusion_model_dir if fusion_model_dir and fusion_model_dir.exists() else None
+        candidate_fusion_dirs = list(fusion_model_dirs or [])
+        if not candidate_fusion_dirs and fusion_model_dir:
+            candidate_fusion_dirs = [fusion_model_dir]
+        self.fusion_model_dirs = [model_dir for model_dir in candidate_fusion_dirs if model_dir.exists()]
+        self.fusion_model_dir = self.fusion_model_dirs[0] if self.fusion_model_dirs else None
+        if fusion_weights and self.fusion_model_dirs:
+            weights = np.asarray(fusion_weights, dtype=np.float32)
+            if len(weights) != len(self.fusion_model_dirs):
+                raise RuntimeError("--fusion-weights must match --fusion-model-dirs count.")
+            weight_sum = float(weights.sum())
+            if weight_sum <= 0:
+                raise RuntimeError("--fusion-weights must sum to a positive value.")
+            self.fusion_weights = (weights / weight_sum).astype(np.float32)
+        elif self.fusion_model_dirs:
+            self.fusion_weights = np.full((len(self.fusion_model_dirs),), 1.0 / len(self.fusion_model_dirs), dtype=np.float32)
+        else:
+            self.fusion_weights = np.asarray([], dtype=np.float32)
         self.fusion_metrics_dir = fusion_metrics_dir if fusion_metrics_dir and fusion_metrics_dir.exists() else None
         self.fusion_metrics = None
         self.fusion_feature_names: list[str] = []
         if self.fusion_metrics_dir:
             with (self.fusion_metrics_dir / "metrics.json").open("r", encoding="utf-8") as f:
                 self.fusion_metrics = json.load(f)
-        if self.fusion_model_dir:
+        if self.fusion_model_dirs:
             import torch
 
             checkpoint = torch.load(
-                self.fusion_model_dir / "thermal_feature_fusion_cnn.pt",
+                self.fusion_model_dirs[0] / "thermal_feature_fusion_cnn.pt",
                 map_location="cpu",
                 weights_only=False,
             )
@@ -138,15 +164,24 @@ class TemperatureService:
             for row in metrics.get("validation", [])
         }
         holdout = self.primary_holdout_metrics()
-        selected_count = len(self.fusion_feature_names) if self.fusion_model_dir else self.metrics.get("selected_feature_count")
+        selected_count = len(self.fusion_feature_names) if self.fusion_model_dirs else self.metrics.get("selected_feature_count")
+        if len(self.fusion_model_dirs) > 1:
+            model_name = "fusion_cnn_article_otsu_top10_qualityframes_seed_ensemble"
+        elif self.fusion_model_dirs:
+            model_name = "fusion_cnn_article_otsu_top10_qualityframes"
+        else:
+            model_name = self.metrics.get("model", self.schema.get("model_name", ""))
         return {
             "model_dir": str(self.fusion_model_dir or self.model_dir),
+            "fusion_model_dirs": [str(model_dir) for model_dir in self.fusion_model_dirs],
+            "fusion_weights": [float(weight) for weight in self.fusion_weights],
             "classical_model_dir": str(self.model_dir),
             "features_csv": str(self.features_csv),
-            "model": "fusion_cnn_article_otsu_top10_qualityframes" if self.fusion_model_dir else self.metrics.get("model", self.schema.get("model_name", "")),
+            "model": model_name,
             "selected_feature_count": selected_count,
             "feature_count": metrics.get("feature_count", selected_count),
-            "sample_count": metrics.get("sample_count", metrics.get("usable_labeled_videos")),
+            "sample_count": metrics.get("usable_labeled_videos", len(self.rows)),
+            "cv_prediction_count": metrics.get("sample_count"),
             "holdout": holdout,
             "validation": validation,
             "holdout_test_videos": metrics.get("holdout_test_videos", metrics.get("holdout", {}).get("test_videos", [])),
@@ -183,17 +218,33 @@ class TemperatureService:
                 "prediction_f": classical_prediction,
             }
         ]
-        if self.fusion_model_dir:
+        if self.fusion_model_dirs:
             from predict_temperature_system import fusion_prediction
 
-            prediction = float(fusion_prediction(self.fusion_model_dir, self.raw_zip, date, sequence_num, row))
-            prediction_source = "fusion_cnn_article_otsu_top10_qualityframes"
-            comparison_predictions.append(
-                {
-                    "model": prediction_source,
-                    "prediction_f": prediction,
-                }
+            fusion_predictions = []
+            for weight, model_dir in zip(self.fusion_weights, self.fusion_model_dirs):
+                model_prediction = float(fusion_prediction(model_dir, self.raw_zip, date, sequence_num, row))
+                fusion_predictions.append(model_prediction)
+                comparison_predictions.append(
+                    {
+                        "model": model_dir.name,
+                        "prediction_f": model_prediction,
+                        "ensemble_weight": float(weight),
+                    }
+                )
+            prediction = float(np.dot(self.fusion_weights, np.asarray(fusion_predictions, dtype=np.float32)))
+            prediction_source = (
+                "fusion_cnn_article_otsu_top10_qualityframes_seed_ensemble"
+                if len(self.fusion_model_dirs) > 1
+                else "fusion_cnn_article_otsu_top10_qualityframes"
             )
+            if len(self.fusion_model_dirs) > 1:
+                comparison_predictions.append(
+                    {
+                        "model": prediction_source,
+                        "prediction_f": prediction,
+                    }
+                )
 
         holdout_rmse = finite_float(self.primary_holdout_metrics().get("rmse"))
         if holdout_rmse is None:
@@ -686,19 +737,31 @@ def main() -> None:
     parser.add_argument("--features-csv", default=DEFAULT_FEATURES, type=Path)
     parser.add_argument("--model-name", default="model_full.joblib")
     parser.add_argument("--raw-zip", default=DEFAULT_RAW_ZIP, type=Path)
-    parser.add_argument("--fusion-model-dir", default=DEFAULT_FUSION_MODEL_DIR, type=Path)
+    parser.add_argument("--fusion-model-dir", type=Path)
+    parser.add_argument("--fusion-model-dirs", nargs="*", type=Path)
+    parser.add_argument("--fusion-weights", nargs="*", type=float)
     parser.add_argument("--fusion-metrics-dir", default=DEFAULT_FUSION_METRICS_DIR, type=Path)
     parser.add_argument("--no-fusion-model", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
     args = parser.parse_args()
 
+    fusion_model_dirs = []
+    if not args.no_fusion_model:
+        if args.fusion_model_dirs:
+            fusion_model_dirs = args.fusion_model_dirs
+        elif args.fusion_model_dir:
+            fusion_model_dirs = [args.fusion_model_dir]
+        else:
+            fusion_model_dirs = DEFAULT_FUSION_MODEL_DIRS
+
     TemperatureHandler.service = TemperatureService(
         args.model_dir,
         args.features_csv,
         args.model_name,
         raw_zip=args.raw_zip,
-        fusion_model_dir=None if args.no_fusion_model else args.fusion_model_dir,
+        fusion_model_dirs=fusion_model_dirs,
+        fusion_weights=None if args.no_fusion_model else args.fusion_weights,
         fusion_metrics_dir=None if args.no_fusion_model else args.fusion_metrics_dir,
     )
     server = ThreadingHTTPServer((args.host, args.port), TemperatureHandler)
