@@ -120,6 +120,117 @@ def fusion_prediction(model_dir: Path, raw_zip: Path, date: str, sequence_num: s
     return scaled * float(state["y_std"]) + float(state["y_mean"])
 
 
+def optional_int(value: object) -> int | None:
+    if value in {None, "None", ""}:
+        return None
+    return int(value)
+
+
+def multi_roi_quality_prediction(
+    model_dir: Path,
+    raw_zip: Path,
+    date: str,
+    sequence_num: str,
+    row: dict[str, object],
+) -> float:
+    from run_grouped_multi_roi_quality_cnn import (
+        MultiRoiQualityFusionRegressor,
+        QUALITY_COLUMNS,
+        ROI_NAMES,
+        crop_roi,
+        read_detection_rows,
+        select_detection_rows,
+    )
+
+    checkpoint = torch.load(model_dir / "multi_roi_quality_fusion_cnn.pt", map_location="cpu", weights_only=False)
+    state = checkpoint["state"]
+    model_args = checkpoint["args"]
+    feature_names = state["feature_names"]
+    feature_median = np.asarray(state["feature_median"], dtype=np.float32)
+    feature_mean = np.asarray(state["feature_mean"], dtype=np.float32)
+    feature_std = np.asarray(state["feature_std"], dtype=np.float32)
+    quality_median = np.asarray(state["quality_median"], dtype=np.float32)
+    quality_mean = np.asarray(state["quality_mean"], dtype=np.float32)
+    quality_std = np.asarray(state["quality_std"], dtype=np.float32)
+
+    features = np.asarray([row.get(name, np.nan) for name in feature_names], dtype=np.float32)
+    features = np.where(np.isfinite(features), features, feature_median)
+    features = ((features - feature_mean) / feature_std).reshape(1, -1)
+
+    raw_index = index_raw_zip(raw_zip)
+    frames = raw_index.get((date, sequence_num), [])
+    if not frames:
+        raise RuntimeError(f"No raw TIFF frames found for {date}/{sequence_num}")
+    frame_map = {frame_id: zip_name for frame_id, zip_name in frames}
+
+    detections_path = Path(str(model_args.get("frame_detections", "data/temperature_outputs/article_otsu_roi_v1/frame_detections.csv")))
+    detections = read_detection_rows(detections_path)
+    rows = detections.get((date, sequence_num), [])
+    if not rows:
+        raise RuntimeError(f"No ROI detection rows found for {date}/{sequence_num}")
+
+    max_frames = int(model_args["max_frames"])
+    image_size = int(model_args["image_size"])
+    roi_size = int(model_args["roi_size"])
+    normalize = str(model_args.get("normalize", "absolute"))
+    thermal_min = float(model_args.get("thermal_min", 15.0))
+    thermal_max = float(model_args.get("thermal_max", 45.0))
+    score_column = str(model_args.get("frame_score_column", "frontal_score"))
+    candidate_limit = optional_int(model_args.get("frame_candidate_limit"))
+    frame_selection = str(model_args.get("frame_selection", "diverse"))
+    selected_rows = select_detection_rows(rows, max_frames, score_column, candidate_limit, frame_selection)
+
+    full_frames = []
+    roi_frames = []
+    quality_rows = []
+    with zipfile.ZipFile(raw_zip) as zf:
+        for detection_row in selected_rows:
+            frame_id = int(detection_row["frame_id"])
+            zip_name = frame_map.get(frame_id)
+            if not zip_name:
+                continue
+            array = read_tiff_array(zf, zip_name)
+            if array is None:
+                continue
+            full_frames.append(normalize_frame(array, image_size, normalize, thermal_min, thermal_max))
+            roi_frames.append(
+                np.stack(
+                    [
+                        crop_roi(array, detection_row, roi_name, roi_size, normalize, thermal_min, thermal_max)
+                        for roi_name in ROI_NAMES
+                    ]
+                ).astype(np.float32)
+            )
+            quality = np.asarray(
+                [float(detection_row.get(name, np.nan)) for name in QUALITY_COLUMNS],
+                dtype=np.float32,
+            )
+            quality = np.where(np.isfinite(quality), quality, quality_median)
+            quality_rows.append(((quality - quality_mean) / quality_std).astype(np.float32))
+    if not full_frames:
+        raise RuntimeError(f"No readable selected ROI frames for {date}/{sequence_num}")
+    while len(full_frames) < max_frames:
+        full_frames.append(full_frames[-1])
+        roi_frames.append(roi_frames[-1])
+        quality_rows.append(quality_rows[-1])
+
+    full_tensor = torch.from_numpy(np.stack(full_frames[:max_frames])).unsqueeze(0).unsqueeze(2).float()
+    roi_tensor = torch.from_numpy(np.stack(roi_frames[:max_frames])).unsqueeze(0).unsqueeze(3).float()
+    quality_tensor = torch.from_numpy(np.stack(quality_rows[:max_frames])).unsqueeze(0).float()
+    feature_tensor = torch.from_numpy(features).float()
+
+    model = MultiRoiQualityFusionRegressor(
+        len(feature_names),
+        len(QUALITY_COLUMNS),
+        float(model_args.get("dropout", 0.35)),
+    )
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+    with torch.no_grad():
+        scaled = float(model(full_tensor, roi_tensor, quality_tensor, feature_tensor).numpy()[0])
+    return scaled * float(state["y_std"]) + float(state["y_mean"])
+
+
 def write_output(path: Path | None, rows: list[dict[str, object]]) -> None:
     if path is None:
         return
@@ -148,11 +259,12 @@ def main() -> None:
             Path("data/temperature_outputs/deployment_fusion_cnn_f12_full_v1"),
         ],
     )
+    parser.add_argument("--multi-roi-model-dirs", nargs="*", type=Path, default=[])
     parser.add_argument(
         "--ensemble-weights",
         nargs="*",
         type=float,
-        help="Optional weights for ROI prediction followed by each fusion model prediction.",
+        help="Optional weights for ROI prediction followed by each fusion and multi-ROI model prediction.",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--show-truth-if-present", action="store_true")
@@ -163,6 +275,13 @@ def main() -> None:
     predictions.append(("roi_gradient_boosting_full", classical_prediction(args.roi_model_dir, row)))
     for model_dir in args.fusion_model_dirs:
         predictions.append((model_dir.name, fusion_prediction(model_dir, args.raw_zip, args.date, args.sequence_num, row)))
+    for model_dir in args.multi_roi_model_dirs:
+        predictions.append(
+            (
+                model_dir.name,
+                multi_roi_quality_prediction(model_dir, args.raw_zip, args.date, args.sequence_num, row),
+            )
+        )
 
     if args.ensemble_weights:
         if len(args.ensemble_weights) != len(predictions):

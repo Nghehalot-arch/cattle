@@ -35,6 +35,7 @@ DEFAULT_FUSION_MODEL_DIRS = [
 DEFAULT_FUSION_METRICS_DIR = Path(
     "data/temperature_outputs/thermal_feature_fusion_cnn_article_otsu_top10_qualityframes_seed_ensemble_equal_v1"
 )
+DEFAULT_MULTI_ROI_MODEL_DIR = Path("data/temperature_outputs/deployment_multi_roi_quality_cnn_reg80_full_v1")
 
 
 def parse_value(name: str, value: str) -> object:
@@ -97,6 +98,8 @@ class TemperatureService:
         fusion_model_dir: Path | None = None,
         fusion_model_dirs: list[Path] | None = None,
         fusion_weights: list[float] | None = None,
+        multi_roi_model_dir: Path | None = None,
+        hybrid_weights: list[float] | None = None,
         fusion_metrics_dir: Path | None = None,
     ):
         self.model_dir = model_dir
@@ -128,6 +131,17 @@ class TemperatureService:
             self.fusion_weights = np.full((len(self.fusion_model_dirs),), 1.0 / len(self.fusion_model_dirs), dtype=np.float32)
         else:
             self.fusion_weights = np.asarray([], dtype=np.float32)
+        self.multi_roi_model_dir = multi_roi_model_dir if multi_roi_model_dir and multi_roi_model_dir.exists() else None
+        if hybrid_weights:
+            weights = np.asarray(hybrid_weights, dtype=np.float32)
+            if len(weights) != 2:
+                raise RuntimeError("--hybrid-weights must contain two values: fusion ensemble, multi-ROI.")
+            weight_sum = float(weights.sum())
+            if weight_sum <= 0:
+                raise RuntimeError("--hybrid-weights must sum to a positive value.")
+            self.hybrid_weights = (weights / weight_sum).astype(np.float32)
+        else:
+            self.hybrid_weights = np.asarray([0.7, 0.3], dtype=np.float32)
         self.fusion_metrics_dir = fusion_metrics_dir if fusion_metrics_dir and fusion_metrics_dir.exists() else None
         self.fusion_metrics = None
         self.fusion_feature_names: list[str] = []
@@ -165,7 +179,11 @@ class TemperatureService:
         }
         holdout = self.primary_holdout_metrics()
         selected_count = len(self.fusion_feature_names) if self.fusion_model_dirs else self.metrics.get("selected_feature_count")
-        if len(self.fusion_model_dirs) > 1:
+        if self.multi_roi_model_dir and self.fusion_model_dirs:
+            model_name = "hybrid_fusion_cnn_multi_roi_quality"
+        elif self.multi_roi_model_dir:
+            model_name = "multi_roi_quality_fusion_cnn"
+        elif len(self.fusion_model_dirs) > 1:
             model_name = "fusion_cnn_article_otsu_top10_qualityframes_seed_ensemble"
         elif self.fusion_model_dirs:
             model_name = "fusion_cnn_article_otsu_top10_qualityframes"
@@ -175,6 +193,8 @@ class TemperatureService:
             "model_dir": str(self.fusion_model_dir or self.model_dir),
             "fusion_model_dirs": [str(model_dir) for model_dir in self.fusion_model_dirs],
             "fusion_weights": [float(weight) for weight in self.fusion_weights],
+            "multi_roi_model_dir": str(self.multi_roi_model_dir) if self.multi_roi_model_dir else None,
+            "hybrid_weights": [float(weight) for weight in self.hybrid_weights] if self.multi_roi_model_dir else None,
             "classical_model_dir": str(self.model_dir),
             "features_csv": str(self.features_csv),
             "model": model_name,
@@ -245,6 +265,34 @@ class TemperatureService:
                         "prediction_f": prediction,
                     }
                 )
+        if self.multi_roi_model_dir:
+            from predict_temperature_system import multi_roi_quality_prediction
+
+            multi_roi_prediction = float(multi_roi_quality_prediction(self.multi_roi_model_dir, self.raw_zip, date, sequence_num, row))
+            comparison_predictions.append(
+                {
+                    "model": self.multi_roi_model_dir.name,
+                    "prediction_f": multi_roi_prediction,
+                    "hybrid_weight": float(self.hybrid_weights[1]),
+                }
+            )
+            if self.fusion_model_dirs:
+                prediction = float(
+                    np.dot(
+                        self.hybrid_weights,
+                        np.asarray([prediction, multi_roi_prediction], dtype=np.float32),
+                    )
+                )
+                prediction_source = "hybrid_fusion_cnn_multi_roi_quality"
+                comparison_predictions.append(
+                    {
+                        "model": prediction_source,
+                        "prediction_f": prediction,
+                    }
+                )
+            else:
+                prediction = multi_roi_prediction
+                prediction_source = "multi_roi_quality_fusion_cnn"
 
         holdout_rmse = finite_float(self.primary_holdout_metrics().get("rmse"))
         if holdout_rmse is None:
@@ -740,6 +788,8 @@ def main() -> None:
     parser.add_argument("--fusion-model-dir", type=Path)
     parser.add_argument("--fusion-model-dirs", nargs="*", type=Path)
     parser.add_argument("--fusion-weights", nargs="*", type=float)
+    parser.add_argument("--multi-roi-model-dir", type=Path)
+    parser.add_argument("--hybrid-weights", nargs="*", type=float)
     parser.add_argument("--fusion-metrics-dir", default=DEFAULT_FUSION_METRICS_DIR, type=Path)
     parser.add_argument("--no-fusion-model", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
@@ -762,6 +812,8 @@ def main() -> None:
         raw_zip=args.raw_zip,
         fusion_model_dirs=fusion_model_dirs,
         fusion_weights=None if args.no_fusion_model else args.fusion_weights,
+        multi_roi_model_dir=None if args.no_fusion_model else args.multi_roi_model_dir,
+        hybrid_weights=None if args.no_fusion_model else args.hybrid_weights,
         fusion_metrics_dir=None if args.no_fusion_model else args.fusion_metrics_dir,
     )
     server = ThreadingHTTPServer((args.host, args.port), TemperatureHandler)
