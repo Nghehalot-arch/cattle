@@ -25,8 +25,8 @@ ID_COLUMNS = {"date", "sequence_num", "cow_tag", "temperature_f"}
 DEFAULT_MODEL_DIR = Path("data/temperature_outputs/detected_article_otsu_fusion_ridge_k20_v1")
 DEFAULT_FEATURES = Path("data/temperature_outputs/detected_article_otsu_fusion_v1/features.csv")
 DEFAULT_RAW_ZIP = Path("data/thermal_raw.zip")
-DEFAULT_FUSION_MODEL_DIR = Path("data/temperature_outputs/deployment_fusion_cnn_article_otsu_top10_full_v1")
-DEFAULT_FUSION_METRICS_DIR = Path("data/temperature_outputs/thermal_feature_fusion_cnn_article_otsu_top10_grouped_v1")
+DEFAULT_FUSION_MODEL_DIR = Path("data/temperature_outputs/deployment_fusion_cnn_article_otsu_top10_qualityframes_full_v1")
+DEFAULT_FUSION_METRICS_DIR = Path("data/temperature_outputs/thermal_feature_fusion_cnn_article_otsu_top10_qualityframes_grouped_v1")
 
 
 def parse_value(name: str, value: str) -> object:
@@ -143,7 +143,7 @@ class TemperatureService:
             "model_dir": str(self.fusion_model_dir or self.model_dir),
             "classical_model_dir": str(self.model_dir),
             "features_csv": str(self.features_csv),
-            "model": "fusion_cnn_article_otsu_top10" if self.fusion_model_dir else self.metrics.get("model", self.schema.get("model_name", "")),
+            "model": "fusion_cnn_article_otsu_top10_qualityframes" if self.fusion_model_dir else self.metrics.get("model", self.schema.get("model_name", "")),
             "selected_feature_count": selected_count,
             "feature_count": metrics.get("feature_count", selected_count),
             "sample_count": metrics.get("sample_count", metrics.get("usable_labeled_videos")),
@@ -187,7 +187,7 @@ class TemperatureService:
             from predict_temperature_system import fusion_prediction
 
             prediction = float(fusion_prediction(self.fusion_model_dir, self.raw_zip, date, sequence_num, row))
-            prediction_source = "fusion_cnn_article_otsu_top10"
+            prediction_source = "fusion_cnn_article_otsu_top10_qualityframes"
             comparison_predictions.append(
                 {
                     "model": prediction_source,

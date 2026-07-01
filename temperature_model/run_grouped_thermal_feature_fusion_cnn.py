@@ -20,9 +20,11 @@ from sklearn.model_selection import GroupKFold
 from common import write_csv
 from train_thermal_feature_fusion_cnn import (
     add_anchor_predictions,
+    apply_frame_filter,
     load_labeled_sequences,
     load_split,
     read_feature_rows,
+    read_frame_filter,
     read_selected_features,
     set_seed,
     train_once,
@@ -166,6 +168,10 @@ def main() -> None:
     parser.add_argument("--features", default="data/temperature_outputs/detected_article_otsu_fusion_v1/features.csv", type=Path)
     parser.add_argument("--selected-features", type=Path)
     parser.add_argument("--feature-limit", type=int)
+    parser.add_argument("--frame-filter-csv", type=Path)
+    parser.add_argument("--frame-score-column", default="frontal_score")
+    parser.add_argument("--frame-candidate-limit", type=int)
+    parser.add_argument("--min-filtered-frames", default=1, type=int)
     parser.add_argument("--anchor-model", type=Path)
     parser.add_argument("--anchor-schema", type=Path)
     parser.add_argument("--anchor-feature-name", default="roi_anchor_prediction")
@@ -189,6 +195,15 @@ def main() -> None:
     args = parser.parse_args()
 
     samples, missing = load_labeled_sequences(args.metadata, args.raw_zip)
+    dropped_frame_filter = []
+    if args.frame_filter_csv:
+        frame_filter = read_frame_filter(args.frame_filter_csv, args.frame_score_column)
+        samples, dropped_frame_filter = apply_frame_filter(
+            samples,
+            frame_filter,
+            candidate_limit=args.frame_candidate_limit,
+            min_frames=args.min_filtered_frames,
+        )
     feature_rows = read_feature_rows(args.features)
     if args.anchor_model:
         if not args.anchor_schema:
@@ -231,6 +246,8 @@ def main() -> None:
                 "features": str(args.features),
                 "selected_features": str(args.selected_features) if args.selected_features else None,
                 "feature_count": len(feature_names),
+                "frame_filter_csv": str(args.frame_filter_csv) if args.frame_filter_csv else None,
+                "dropped_frame_filter": dropped_frame_filter,
                 "feature_names": feature_names,
                 "holdout": holdout,
                 "validation": validation,

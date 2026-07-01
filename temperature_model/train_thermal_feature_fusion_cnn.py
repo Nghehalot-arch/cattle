@@ -132,6 +132,66 @@ def load_labeled_sequences(metadata_path: Path, raw_zip: Path) -> tuple[list[Seq
     return samples, missing
 
 
+def read_frame_filter(path: Path, score_column: str = "frontal_score") -> dict[tuple[str, str], list[tuple[int, float]]]:
+    frame_filter: dict[tuple[str, str], list[tuple[int, float]]] = {}
+    with path.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            try:
+                frame_id = int(float(row["frame_id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            try:
+                score = float(row.get(score_column, "0") or 0)
+            except ValueError:
+                score = 0.0
+            frame_filter.setdefault((row["date"], row["sequence_num"]), []).append((frame_id, score))
+    for key in frame_filter:
+        frame_filter[key].sort(key=lambda item: item[0])
+    return frame_filter
+
+
+def filter_frames_for_key(
+    frames: list[tuple[int, str]],
+    date: str,
+    sequence_num: str,
+    frame_filter: dict[tuple[str, str], list[tuple[int, float]]],
+    candidate_limit: int | None = None,
+) -> list[tuple[int, str]]:
+    scored_ids = frame_filter.get((date, sequence_num))
+    if not scored_ids:
+        return frames
+    if candidate_limit:
+        scored_ids = sorted(scored_ids, key=lambda item: item[1], reverse=True)[:candidate_limit]
+    allowed_ids = {frame_id for frame_id, _ in scored_ids}
+    frame_map = {frame_id: zip_name for frame_id, zip_name in frames}
+    return [(frame_id, frame_map[frame_id]) for frame_id in sorted(allowed_ids) if frame_id in frame_map]
+
+
+def apply_frame_filter(
+    samples: list[SequenceSample],
+    frame_filter: dict[tuple[str, str], list[tuple[int, float]]],
+    candidate_limit: int | None = None,
+    min_frames: int = 1,
+) -> tuple[list[SequenceSample], list[dict[str, object]]]:
+    filtered_samples = []
+    dropped = []
+    for sample in samples:
+        frames = filter_frames_for_key(sample.frames, sample.date, sample.sequence_num, frame_filter, candidate_limit)
+        if len(frames) < min_frames:
+            dropped.append({"sequence": sample.key, "available_frames": len(frames)})
+            continue
+        filtered_samples.append(
+            SequenceSample(
+                date=sample.date,
+                sequence_num=sample.sequence_num,
+                cow_tag=sample.cow_tag,
+                temperature_f=sample.temperature_f,
+                frames=frames,
+            )
+        )
+    return filtered_samples, dropped
+
+
 def load_split(path: Path) -> tuple[set[str], set[str]]:
     with path.open("r", encoding="utf-8") as f:
         split = json.load(f)
@@ -447,6 +507,10 @@ def main():
     parser.add_argument("--features", default="data/temperature_outputs/detected_roi_filtered_80_v1/features.csv", type=Path)
     parser.add_argument("--selected-features", type=Path)
     parser.add_argument("--feature-limit", type=int)
+    parser.add_argument("--frame-filter-csv", type=Path)
+    parser.add_argument("--frame-score-column", default="frontal_score")
+    parser.add_argument("--frame-candidate-limit", type=int)
+    parser.add_argument("--min-filtered-frames", default=1, type=int)
     parser.add_argument("--anchor-model", type=Path)
     parser.add_argument("--anchor-schema", type=Path)
     parser.add_argument("--anchor-feature-name", default="roi_anchor_prediction")
@@ -474,6 +538,15 @@ def main():
 
     set_seed(args.seed)
     samples, missing = load_labeled_sequences(args.metadata, args.raw_zip)
+    dropped_frame_filter = []
+    if args.frame_filter_csv:
+        frame_filter = read_frame_filter(args.frame_filter_csv, args.frame_score_column)
+        samples, dropped_frame_filter = apply_frame_filter(
+            samples,
+            frame_filter,
+            candidate_limit=args.frame_candidate_limit,
+            min_frames=args.min_filtered_frames,
+        )
     feature_rows = read_feature_rows(args.features)
     if args.anchor_model:
         if not args.anchor_schema:
@@ -519,6 +592,8 @@ def main():
                 "usable_labeled_videos": len(samples),
                 "missing_raw_labeled_videos": len(missing),
                 "feature_count": len(feature_names),
+                "frame_filter_csv": str(args.frame_filter_csv) if args.frame_filter_csv else None,
+                "dropped_frame_filter": dropped_frame_filter,
                 "evaluation": evaluation,
                 "train_videos": [sample.key for sample in train_samples],
                 "test_videos": [sample.key for sample in test_samples],

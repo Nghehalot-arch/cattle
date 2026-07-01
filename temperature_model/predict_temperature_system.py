@@ -21,8 +21,10 @@ import torch
 from train_thermal_feature_fusion_cnn import (
     ThermalFeatureFusionRegressor,
     choose_evenly_spaced,
+    filter_frames_for_key,
     index_raw_zip,
     normalize_frame,
+    read_frame_filter,
     read_tiff_array,
 )
 
@@ -56,6 +58,15 @@ def load_raw_frame_tensor(raw_zip: Path, date: str, sequence_num: str, model_arg
     frames = raw_index.get((date, sequence_num), [])
     if not frames:
         raise RuntimeError(f"No raw TIFF frames found for {date}/{sequence_num}")
+
+    frame_filter_csv = model_args.get("frame_filter_csv")
+    if frame_filter_csv and str(frame_filter_csv) != "None":
+        frame_filter = read_frame_filter(Path(frame_filter_csv), str(model_args.get("frame_score_column", "frontal_score")))
+        candidate_limit = model_args.get("frame_candidate_limit")
+        candidate_limit = int(candidate_limit) if candidate_limit not in {None, "None"} else None
+        filtered_frames = filter_frames_for_key(frames, date, sequence_num, frame_filter, candidate_limit)
+        if filtered_frames:
+            frames = filtered_frames
 
     max_frames = int(model_args["max_frames"])
     image_size = int(model_args["image_size"])
