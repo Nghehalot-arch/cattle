@@ -1,5 +1,11 @@
 # Added CattleFever Temperature Pipeline
 
+> Current handoff note: the top-level `README.md` is now the main setup and
+> model-status document. This folder README keeps older command history for the
+> temperature experiments. The current strongest baseline is the 4-seed
+> CNN + article-Otsu ROI fusion ensemble, not the older
+> `detected_roi_filtered_80_v1` Random Forest run described later in this file.
+
 This folder is intentionally separate from the original Detectron2 keypoint
 code. The original repo is the facial keypoint detector. This added module
 extends it toward the article-level CattleFever workflow:

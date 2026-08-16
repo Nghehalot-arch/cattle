@@ -1,0 +1,17 @@
+{
+  "rows": 21,
+  "detected_rows": 21,
+  "article_rows": 21,
+  "shared_rows": 21,
+  "detected_only_rows": 0,
+  "article_only_rows": 0,
+  "include_count_features": false,
+  "add_balance": true,
+  "engineered_feature_count_min": 502,
+  "engineered_feature_count_max": 502,
+  "engineered_feature_count_mean": 502.0,
+  "detected_features": "data\\temperature_outputs\\detected_roi_filtered_80_v1\\features.csv",
+  "article_features": "data\\temperature_outputs\\article_otsu_roi_v1\\features.csv",
+  "output": "data\\temperature_outputs\\detected_article_otsu_fusion_v1\\features.csv",
+  "feature_count": 2832
+}

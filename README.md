@@ -1,216 +1,302 @@
-# d2.cattle
-detectron2 for cattle (boxes, masks, and keypoints)
+# Cattle Fever Temperature Model
 
-## Installation
+This repository started from the cattle facial keypoint Detectron2 project. I
+extended it into a CattleFever-style temperature pipeline that uses thermal
+frames, detected face landmarks, article-style facial ROIs, and rectal
+temperature labels.
+
+The current working model is not a Transformer model. The best result so far is
+a 4-seed ensemble that combines:
+
+```text
+raw thermal frames
+detected cattle face/keypoints
+article-style Otsu thermal ROI features
+selected thermal balance features
+small CNN + ROI feature fusion
 ```
+
+The UI/API can show predicted internal temperature, fever risk, selected
+signals, validation metrics, and a quality/confidence check for the input
+frames.
+
+## Current Status
+
+The strongest stable baseline is:
+
+```text
+4-seed CNN + article-Otsu ROI feature fusion
+```
+
+Grouped cross-validation results:
+
+| Grouped split | MAE F | MSE | RMSE F |
+|---|---:|---:|---:|
+| Sequence grouped | 0.705 | 0.619 | 0.781 |
+| Cow grouped | 0.708 | 0.646 | 0.797 |
+| Date grouped | 0.724 | 0.661 | 0.798 |
+
+These are honest grouped-CV numbers, so the model is not being judged by random
+frame leakage. The result is working, but it is still above the article-level
+MSE target that we were trying to approach.
+
+## What Is Included
+
+Important folders and scripts:
+
+```text
+configs/                         Detectron2 cattle keypoint configs
+temperature_model/               Temperature modeling pipeline
+temperature_model/serve_temperature_ui.py
+                                  Local API and browser UI
+temperature_model/extract_article_otsu_roi_features.py
+                                  Article-style Otsu ROI feature extraction
+temperature_model/merge_roi_feature_sets.py
+                                  Merge detected ROI + article ROI features
+temperature_model/run_grouped_thermal_feature_fusion_cnn.py
+                                  Grouped CV for CNN + ROI feature fusion
+temperature_model/train_thermal_feature_fusion_cnn.py
+                                  Train/deploy the fusion CNN
+temperature_model/build_quality_gate_v2.py
+                                  Frame quality/confidence scoring
+```
+
+Large raw data, TIFF folders, ZIP files, and most generated outputs are kept out
+of git by `.gitignore`. The small locked model artifacts can be tracked, but the
+raw thermal ZIP is about 4.2 GB and must be copied separately or stored in a
+release/LFS/OneDrive location.
+
+## Data Expected Locally
+
+The temperature pipeline expects these local files/folders:
+
+```text
+data/annotations/metadata.csv
+data/thermal_raw.zip
+data/temperature_outputs/article_otsu_roi_v1/
+data/temperature_outputs/detected_roi_filtered_80_v1/
+data/temperature_outputs/detected_article_otsu_fusion_v1/
+data/temperature_outputs/detected_article_otsu_fusion_ridge_k20_v1/
+data/temperature_outputs/deployment_fusion_cnn_article_otsu_top10_qualityframes_full_v1/
+data/temperature_outputs/deployment_fusion_cnn_article_otsu_top10_qualityframes_seed42_full_v1/
+data/temperature_outputs/deployment_fusion_cnn_article_otsu_top10_qualityframes_seed2026_full_v1/
+data/temperature_outputs/deployment_fusion_cnn_article_otsu_top10_qualityframes_seed7_full_v1/
+data/temperature_outputs/quality_gate_v2_lenient_all/
+```
+
+If these folders are missing after cloning, copy them from the local project
+backup or regenerate them using the commands below.
+
+## Environment Setup
+
+The project was run with Python 3.8 in a Conda environment named `d2.cattle`.
+
+```powershell
 conda create -n d2.cattle python=3.8 -y
-conda activate d2.cattle 
+conda activate d2.cattle
+
 conda install pytorch==1.10.0 torchvision==0.11.0 cudatoolkit=11.3 -c pytorch
-
-# coco api
 pip install pycocotools
-
-# detectron2
-python -m pip install detectron2 -f \
-  https://dl.fbaipublicfiles.com/detectron2/wheels/cu113/torch1.10/index.html
-
-# cv2
 pip install opencv-python
-
-# setuptools
 pip install setuptools==59.5.0
+
+python -m pip install detectron2 -f https://dl.fbaipublicfiles.com/detectron2/wheels/cu113/torch1.10/index.html
 ```
 
-## Usage
-### Clean RGB workflow used in this repo
-Use this when starting from `data/annotations/rgb_keypoints.json`.
+Run all commands from the repository root.
 
-```bash
-python make_rgb_train_test_split.py
+## Start The API/UI
+
+This starts the current local UI/API using the locked 4-seed ensemble if the
+deployment folders are present:
+
+```powershell
+conda activate d2.cattle
+python temperature_model\serve_temperature_ui.py --port 8770
 ```
 
-This creates a non-overlapping split under `datasets/keypoints/coco_format/`:
+Open:
 
-```
-train_imgs/  + annotations/train.json   # model training
-val_imgs/    + annotations/val.json     # validation during training
-test_imgs/   + annotations/test.json    # final holdout evaluation
-demo_imgs/   + annotations/demo.json    # demo/inference examples
+```text
+http://127.0.0.1:8770
 ```
 
-The split script keeps source folder identity in the copied image names, for example
-`rgb/25/00001.jpg` becomes `rgb_25_00001.jpg`. This prevents different source
-folders with the same frame name from overwriting each other or leaking across
-splits.
+Example API call:
 
-After splitting, sanity-check annotations:
-
-```bash
-python visualize_data.py --config-file configs/CattleKeypoints/keypoints_rcnn_R_50_FPN.yaml --dataset-name keypoints_demo --output-dir data/outtest/viz_demo_check --source annotation
+```text
+http://127.0.0.1:8770/api/predict?date=02_01&sequence_num=0001&threshold_f=103.5
 ```
 
-Then train. The default config trains on `keypoints_train` and validates on
-`keypoints_val`.
+The output includes:
 
-### Temperature estimation workflow
-The keypoint models are only the first part of the CattleFever-style pipeline.
-For rectal/internal temperature estimation, first audit which metadata rows have
-both `temperature_f` and raw thermal TIFF frames:
-
-```bash
-python temperature_model/audit_temperature_data.py
+```text
+prediction_f
+fever_flag
+fever_probability_research
+expected_error_rmse_f
+ambient_proxy_c
+internal_hot_proxy_c
+quality_gate_v2
+selected_features
 ```
 
-Then train the current raw-TIFF baseline:
+`quality_gate_v2` is not the temperature model. It is a frame quality/confidence
+check. It tells us whether the available cow-face frames look good enough to
+trust the prediction.
 
-```bash
-python temperature_model/train_raw_baseline.py --max-frames 80 --output-dir data/temperature_outputs/raw_baseline_v1
+## Rebuild The Main Temperature Features
+
+Audit the temperature labels and raw thermal coverage:
+
+```powershell
+python temperature_model\audit_temperature_data.py
 ```
 
-For the fuller CattleFever-style path, extract detected keypoint ROI features
-from raw TIFFs and train a Random Forest regressor:
+Extract article-style Otsu ROI features:
 
-```bash
-python temperature_model/make_paired_rgb_thermal_split.py
-python temperature_model/extract_detected_roi_features.py --max-frames 30 --output-dir data/temperature_outputs/detected_roi_v1
-python temperature_model/train_temperature_regressor.py --features data/temperature_outputs/detected_roi_v1/features.csv --output-dir data/temperature_outputs/detected_roi_v1
-python temperature_model/combine_features.py --left data/temperature_outputs/raw_baseline_v1/features.csv --right data/temperature_outputs/detected_roi_v1/features.csv --output data/temperature_outputs/combined_v1/features.csv
-python temperature_model/train_temperature_regressor.py --features data/temperature_outputs/combined_v1/features.csv --output-dir data/temperature_outputs/combined_v1
+```powershell
+python temperature_model\extract_article_otsu_roi_features.py `
+  --max-frames 80 `
+  --output-dir data\temperature_outputs\article_otsu_roi_v1
 ```
 
-This writes:
+Merge detected ROI and article-Otsu ROI features:
 
-```
-data/temperature_outputs/*/
-  features.csv
-  metrics.json
-  predictions.csv
-  feature_importance.csv
-  split.json
-  temperature_random_forest.joblib
+```powershell
+python temperature_model\merge_roi_feature_sets.py `
+  --detected-features data\temperature_outputs\detected_roi_filtered_80_v1\features.csv `
+  --article-features data\temperature_outputs\article_otsu_roi_v1\features.csv `
+  --output-dir data\temperature_outputs\detected_article_otsu_fusion_v1
 ```
 
-The raw baseline uses whole-frame TIFF statistics. The detected-ROI workflow is
-closer to the CattleFever article: it runs the trained thermal keypoint detector
-on sampled raw TIFF frames, scales predicted face landmarks back to the raw
-thermal resolution, and extracts temperatures from specific facial regions such
-as the muzzle, nostrils, mouth, and eyes.
+Lock the small classical ROI model used by the UI:
 
-### 1. Visualize datasets
-```bash
-python visualize_data.py --dataset-name keypoints_train --output-dir data/outtest/viz_back_kp_test/ --source annotation 
-```
-### 2. Training
-Example of training keypoints dectection on back cattle dataset, using R50 FPN as backbone.
-```bash
-python train_net.py --config-file configs/CattleKeypoints/keypoints_rcnn_R_50_FPN.yaml
+```powershell
+python temperature_model\lock_best_roi_model.py `
+  --features data\temperature_outputs\detected_article_otsu_fusion_v1\features.csv `
+  --output-dir data\temperature_outputs\detected_article_otsu_fusion_ridge_k20_v1 `
+  --select-k 20 `
+  --model ridge `
+  --split-metrics data\temperature_outputs\thermal_cnn_absolute_quick_lr1e3_v1\metrics.json
 ```
 
-### 3. Testing
-Example of testing keypoints dectection on back cattle dataset, using R50 FPN as backbone.
-```bash
-python train_net.py --num-gpus 1 --config-file configs/cattleKeypoints/keypoints_rcnn_R_50_FPN.yaml --eval-only MODEL.WEIGHTS data/train_outputs/test/model_final.pth OUTPUT_DIR data/train_outputs/test/ 
+## Run Grouped CV For The Current CNN Fusion Baseline
+
+Single-seed grouped CV:
+
+```powershell
+python temperature_model\run_grouped_thermal_feature_fusion_cnn.py `
+  --features data\temperature_outputs\detected_article_otsu_fusion_v1\features.csv `
+  --selected-features data\temperature_outputs\detected_article_otsu_fusion_ridge_k20_v1\selected_features_full.csv `
+  --feature-limit 10 `
+  --frame-filter-csv data\temperature_outputs\article_otsu_roi_v1\frame_detections.csv `
+  --frame-score-column frontal_score `
+  --output-dir data\temperature_outputs\thermal_feature_fusion_cnn_article_otsu_top10_qualityframes_grouped_v1 `
+  --max-frames 8 `
+  --epochs 250 `
+  --batch-size 2 `
+  --lr 0.0005 `
+  --weight-decay 0.001 `
+  --dropout 0.15 `
+  --log-period 125
 ```
 
-### 3.5. Inference
-```bash
-python infer_net.py --num-gpus 1 --config-file configs/CattleKeypoints/keypoints_rcnn_R_50_FPN.yaml  MODEL.WEIGHTS data/train_outputs/test/model_final.pth OUTPUT_DIR data/train_outputs/test/   DATASETS.TEST "('keypoints_test_infer',)"
-python infer_net.py --num-gpus 1 --config-file configs/CattleKeypoints/keypoints_rcnn_R_50_FPN.yaml  MODEL.WEIGHTS data/train_outputs/test/model_final.pth OUTPUT_DIR data/train_outputs/train/   DATASETS.TEST "('keypoints_train',)"
+The current best result is the 4-seed ensemble of this model family. The
+deployment folders are:
 
-```
-For larger batches, paths.json can be loaded with a list of paths to videos desired for predictions. The inference.bash file can then be altered for the number of videos and ran. The predictions for each video will then be stored in "datasets/keypoints/coco_format/annotations/inferences"
-
-
-### 4. Demoing
-```bash
-cd demo/
-python demo.py --config-file ${config_file_path} \
-  --input ${img_path}/*jpg \
-  --output ${output_path} \
-  --confidence-threshold 0.9 \
-  --opts MODEL.WEIGHTS ${model_path}
+```text
+deployment_fusion_cnn_article_otsu_top10_qualityframes_full_v1
+deployment_fusion_cnn_article_otsu_top10_qualityframes_seed42_full_v1
+deployment_fusion_cnn_article_otsu_top10_qualityframes_seed2026_full_v1
+deployment_fusion_cnn_article_otsu_top10_qualityframes_seed7_full_v1
 ```
 
-### 5. Visualize results
-```bash
-# For set with annotations
-python visualize_json_results.py --input /home/ethan/d2.cattle/data/train_outputs/test/inference/coco_instances_results.json --output data/inference/vis --dataset keypoints_test
+## Quality Gate V2
 
-# For set without annotations
-python visualize_json_results_infer.py --input /home/ethan/d2.cattle/data/train_outputs/test/inference/coco_instances_results.json --output data/inference/vis_test --dataset keypoints_test_infer
-python visualize_json_results_infer.py --input /home/ptthang/d2.cattle/data/train_outputs/train/inference/coco_instances_results.json --output data/inference/vis_train --dataset keypoints_train
+Quality gate v2 scores frames by face/keypoint geometry, frontal quality,
+detection confidence, ROI size, and Otsu mask usability.
 
-# to merge into videos (with consecutive frames)
-python visualize_json_results_infer_merge_video.py --output data/inference/vis_test
-python visualize_json_results_infer_merge_video.py --output data/inference/vis_train
+Build the current quality summary:
+
+```powershell
+python temperature_model\build_quality_gate_v2.py `
+  --output-dir data\temperature_outputs\quality_gate_v2_lenient_all `
+  --min-score 0.36 `
+  --min-frontal-score 0.20 `
+  --face-area-min 0.08 `
+  --face-area-max 0.52 `
+  --muzzle-symmetry-max 0.65
 ```
 
+We tested using this gate for hard filtering and weighted frame selection. It
+did not beat the locked 4-seed ensemble, so it should be used as confidence/QA,
+not as a replacement model.
 
-### New data
-- download the json annotation file for each folder
-- merge them into one json file, and split into train and test json
-- split them into train and test images
+Best tested weighted-sampling candidate:
 
-The final structure must be
+| Candidate | Sequence MSE | Cow MSE | Date MSE |
+|---|---:|---:|---:|
+| Frontal score-diverse sampling | 0.686 | 0.652 | 0.713 |
+| Locked 4-seed ensemble | 0.619 | 0.646 | 0.661 |
+
+## What We Tried
+
+Tested approaches:
+
+```text
+raw thermal statistical baseline
+detected ROI classical regressors
+article-style Otsu ROI features
+detected ROI + article ROI feature fusion
+CNN + ROI feature fusion
+4-seed CNN ensemble
+multi-ROI branch CNN
+quality-gated frame filtering
+quality-weighted frame sampling
 ```
+
+The CNN + article-Otsu ROI fusion ensemble is still the best stable model.
+The multi-ROI branch and quality-gated frame filtering were useful experiments,
+but they did not improve the grouped-CV result enough to replace the baseline.
+
+We have not trained a Transformer model yet. With only 21 usable labeled raw
+thermal sequences, a large Transformer is likely to overfit unless it is used as
+a mostly frozen pretrained feature extractor or trained with extra unlabeled
+data first.
+
+## Where We Left Off
+
+The next real improvement step should be:
+
+```text
+residual calibration under grouped CV
+```
+
+That means checking whether prediction errors are related to ambient proxy,
+date, frame quality, hot-face proxy, or ROI confidence, and then testing a
+leakage-safe residual correction model.
+
+The next production step should be:
+
+```text
+new input -> keypoint detection -> article Otsu ROI extraction -> features -> 4-seed ensemble -> API/UI result
+```
+
+Right now the UI works best for sequences that already have precomputed feature
+rows. For completely new uploaded images/videos, the preprocessing pipeline
+still needs to be wrapped behind the API.
+
+## Notes For GitHub Upload
+
+The repository intentionally does not commit large raw data artifacts:
+
+```text
 data/
-  train_imgs/
-    *.jpg
-  test_imgs/
-    *.jpg
-  annotations/
-    *.json
-```
-Before doing this, you should backup the old data folder. Then run the original script like normal. Or you can create new data, but remember to change all the config and python scripts too. 
-
-You can use the notebook `make_new_data.ipynb` to convert any new data into the required format.
-Then you should run step 1 to make sure the folder can be visualized correctly.
-Then you can train it.
-
-visualize
-```bash
-python train_net.py --config-file configs/CattleKeypoints/keypoints_rcnn_R_50_FPN.yaml
-python train_net.py --config-file configs/CattleKeypoints/keypoints_rcnn_R_50_FPN_withaligned.yaml
-
-
-python infer_net.py --num-gpus 1 --config-file configs/CattleKeypoints/keypoints_rcnn_R_50_FPN_withaligned.yaml  MODEL.WEIGHTS data/train_outputs/test/model_final.pth OUTPUT_DIR data/train_outputs/test/   DATASETS.TEST "('keypoints_test_infer',)"
-python infer_net.py --num-gpus 1 --config-file configs/CattleKeypoints/keypoints_rcnn_R_50_FPN_withaligned.yaml  MODEL.WEIGHTS data/train_outputs/test/model_final.pth OUTPUT_DIR data/train_outputs/train/   DATASETS.TEST "('keypoints_train',)"
-
-python visualize_json_results_infer.py --input /home/ptthang/d2.cattle/data/train_outputs/test/inference/coco_instances_results.json --output data/inference3/vis_test --dataset keypoints_test_infer
-python visualize_json_results_infer.py --input /home/ptthang/d2.cattle/data/train_outputs/train/inference/coco_instances_results.json --output data/inference3/vis_train --dataset keypoints_train
-
-
-python visualize_json_results_infer_merge_video.py --output data/inference2/vis_test
-python visualize_json_results_infer_merge_video.py --output data/inference3/vis_test
-
+thermal_raw/
+*.zip
+vendor/
 ```
 
-Sometimes the model is not confident enough, they will result in empty predictions. In this case, you can try to 
-- increase the number of training sample and train again 
-- Make sure the training and testing set are of the same distribution (looks similar)
-
-However, if you still want to force predictions anyway, you can change this field in the configs/CattleKeypoints/keypoints_rcnn_R_50_FPN.yaml
-```yaml
-   SCORE_THRESH_TEST: 0.0
-```
-By default of detectron2, it is 0.05. By forcing it 0.0, you get low confident prediction too. Maybe we need them, maybe not. 
-
-### Training data used 
-[https://uark-my.sharepoint.com/:f:/g/personal/ejc012_uark_edu/IgD9oO_F1qxBT66l7iWoU00nAS-w50gc1BltBsg08eCVRQo](https://uark-my.sharepoint.com/:f:/g/personal/ejc012_uark_edu/IgD9oO_F1qxBT66l7iWoU00nAS-w50gc1BltBsg08eCVRQo) 
-
-### Correction Tool
-
-In the KeyPointCorrector folder is the source code for a windows app used to manually correct data by drag and dropping each point.
-
-Use "browse button" to select the folder you wish to correct. This folder should follow the structure and naming convention
-
-your_folder/
-  images/
-    *.jpg
-  metadata_csharp.json
-
-Correct points and then use the "Next" and "Previous" buttons to navigate through each image in the folder. Additionally you can mark an unwanted image for discard by clicking the "Discard" button which will then update the status of the image. 
-
-Once you are finished you can click the "Save Button" this will give you the option to select a location for the json file modified from metadata_charp according to your corrections. Additionally, any images marked for discard will be removed from the images folder.
-
-The tool also contains hot-keys to move points quicker. This is done by holing the key asscociated with the desired point and then clicking. This will bring the point to your cursors location. 1-9 correspond to their given numbers while q-r on the keyboard correspond to 10-13.
+This keeps GitHub usable. The minimum model outputs are small enough to track,
+but a fresh clone still needs `data/thermal_raw.zip` or equivalent raw TIFFs for
+the CNN ensemble to run predictions.

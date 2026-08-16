@@ -36,6 +36,7 @@ DEFAULT_FUSION_METRICS_DIR = Path(
     "data/temperature_outputs/thermal_feature_fusion_cnn_article_otsu_top10_qualityframes_seed_ensemble_equal_v1"
 )
 DEFAULT_MULTI_ROI_MODEL_DIR = Path("data/temperature_outputs/deployment_multi_roi_quality_cnn_reg80_full_v1")
+DEFAULT_QUALITY_GATE_CSV = Path("data/temperature_outputs/quality_gate_v2_lenient_all/frame_quality_all.csv")
 
 
 def parse_value(name: str, value: str) -> object:
@@ -101,6 +102,7 @@ class TemperatureService:
         multi_roi_model_dir: Path | None = None,
         hybrid_weights: list[float] | None = None,
         fusion_metrics_dir: Path | None = None,
+        quality_gate_csv: Path | None = DEFAULT_QUALITY_GATE_CSV,
     ):
         self.model_dir = model_dir
         self.features_csv = features_csv
@@ -113,6 +115,8 @@ class TemperatureService:
         self.feature_names = list(self.schema["feature_names"])
         self.rows = read_feature_rows(features_csv)
         self.rows_by_key = {(str(row["date"]), str(row["sequence_num"])): row for row in self.rows}
+        self.quality_gate_csv = quality_gate_csv if quality_gate_csv and quality_gate_csv.exists() else None
+        self.quality_rows_by_key = self._load_quality_gate_rows(self.quality_gate_csv)
         self.selected_features = read_csv_rows(model_dir / "selected_features_full.csv")
         candidate_fusion_dirs = list(fusion_model_dirs or [])
         if not candidate_fusion_dirs and fusion_model_dir:
@@ -158,6 +162,45 @@ class TemperatureService:
             )
             self.fusion_feature_names = list(checkpoint["state"]["feature_names"])
 
+    def _load_quality_gate_rows(self, path: Path | None) -> dict[tuple[str, str], list[dict[str, object]]]:
+        if path is None:
+            return {}
+        rows_by_key: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for row in read_csv_rows(path):
+            rows_by_key.setdefault((str(row.get("date", "")), str(row.get("sequence_num", ""))), []).append(row)
+        return rows_by_key
+
+    def quality_summary(self, date: str, sequence_num: str) -> dict[str, object] | None:
+        rows = self.quality_rows_by_key.get((date, sequence_num), [])
+        if not rows:
+            return None
+        scores = [finite_float(row.get("quality_gate_v2_score")) for row in rows]
+        scores = [score for score in scores if score is not None]
+        accepts = [finite_float(row.get("quality_gate_v2_accept")) for row in rows]
+        accepts = [accept for accept in accepts if accept is not None]
+        accepted_fraction = float(np.mean([1.0 if accept >= 1.0 else 0.0 for accept in accepts])) if accepts else None
+        mean_score = float(np.mean(scores)) if scores else None
+        min_score = float(np.min(scores)) if scores else None
+        max_score = float(np.max(scores)) if scores else None
+
+        if mean_score is None:
+            label = "unknown"
+        elif len(rows) < 8 or (accepted_fraction is not None and accepted_fraction < 0.35) or mean_score < 0.55:
+            label = "low"
+        elif (accepted_fraction is not None and accepted_fraction < 0.60) or mean_score < 0.75:
+            label = "medium"
+        else:
+            label = "high"
+        return {
+            "label": label,
+            "frame_count": len(rows),
+            "score_mean": mean_score,
+            "score_min": min_score,
+            "score_max": max_score,
+            "accepted_fraction": accepted_fraction,
+            "source": str(self.quality_gate_csv) if self.quality_gate_csv else None,
+        }
+
     def primary_metrics(self) -> dict[str, object]:
         return self.fusion_metrics or self.metrics
 
@@ -197,6 +240,7 @@ class TemperatureService:
             "hybrid_weights": [float(weight) for weight in self.hybrid_weights] if self.multi_roi_model_dir else None,
             "classical_model_dir": str(self.model_dir),
             "features_csv": str(self.features_csv),
+            "quality_gate_csv": str(self.quality_gate_csv) if self.quality_gate_csv else None,
             "model": model_name,
             "selected_feature_count": selected_count,
             "feature_count": metrics.get("feature_count", selected_count),
@@ -210,6 +254,7 @@ class TemperatureService:
     def sequences(self) -> list[dict[str, object]]:
         output = []
         for row in self.rows:
+            quality = self.quality_summary(str(row["date"]), str(row["sequence_num"]))
             output.append(
                 {
                     "date": row["date"],
@@ -219,6 +264,8 @@ class TemperatureService:
                     "detected_frame_count": row.get("detected_frame_count"),
                     "fusion_ambient_proxy_c": row.get("fusion_ambient_proxy_c"),
                     "fusion_internal_hot_proxy_c": row.get("fusion_internal_hot_proxy_c"),
+                    "quality_gate_v2_label": quality.get("label") if quality else None,
+                    "quality_gate_v2_score_mean": quality.get("score_mean") if quality else None,
                 }
             )
         return output
@@ -346,6 +393,7 @@ class TemperatureService:
             "fever_flag": flag,
             "ambient_proxy_c": row.get("fusion_ambient_proxy_c"),
             "internal_hot_proxy_c": row.get("fusion_internal_hot_proxy_c"),
+            "quality_gate_v2": self.quality_summary(date, sequence_num),
             "selected_features": selected,
         }
         if truth is not None:
@@ -529,7 +577,7 @@ HTML = r"""<!doctype html>
     .muted { color: var(--muted); }
     .split {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(4, 1fr);
       gap: 10px;
     }
     .mini {
@@ -581,6 +629,7 @@ HTML = r"""<!doctype html>
         </div>
         <div class="split" style="margin-top: 14px;">
           <div class="mini"><span>Risk</span><strong id="risk">--</strong></div>
+          <div class="mini"><span>QA</span><strong id="qaScore">--</strong></div>
           <div class="mini"><span>Ambient C</span><strong id="ambient">--</strong></div>
           <div class="mini"><span>Hot Proxy C</span><strong id="hotProxy">--</strong></div>
         </div>
@@ -649,6 +698,8 @@ HTML = r"""<!doctype html>
       truth.textContent = fmt(result.temperature_f, 2);
       error.textContent = fmt(result.error_f, 2);
       risk.textContent = `${fmt(100 * result.fever_probability_research, 0)}%`;
+      const qa = result.quality_gate_v2 || {};
+      qaScore.textContent = qa.label ? `${qa.label} ${fmt(qa.score_mean, 2)}` : "--";
       ambient.textContent = fmt(result.ambient_proxy_c, 2);
       hotProxy.textContent = fmt(result.internal_hot_proxy_c, 2);
       flag.textContent = result.fever_flag.replace("_", " ");
@@ -791,6 +842,7 @@ def main() -> None:
     parser.add_argument("--multi-roi-model-dir", type=Path)
     parser.add_argument("--hybrid-weights", nargs="*", type=float)
     parser.add_argument("--fusion-metrics-dir", default=DEFAULT_FUSION_METRICS_DIR, type=Path)
+    parser.add_argument("--quality-gate-csv", default=DEFAULT_QUALITY_GATE_CSV, type=Path)
     parser.add_argument("--no-fusion-model", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
@@ -815,6 +867,7 @@ def main() -> None:
         multi_roi_model_dir=None if args.no_fusion_model else args.multi_roi_model_dir,
         hybrid_weights=None if args.no_fusion_model else args.hybrid_weights,
         fusion_metrics_dir=None if args.no_fusion_model else args.fusion_metrics_dir,
+        quality_gate_csv=args.quality_gate_csv,
     )
     server = ThreadingHTTPServer((args.host, args.port), TemperatureHandler)
     print(f"Serving cattle temperature UI at http://{args.host}:{args.port}")

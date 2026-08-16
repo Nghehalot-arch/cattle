@@ -172,6 +172,14 @@ def main() -> None:
     parser.add_argument("--frame-score-column", default="frontal_score")
     parser.add_argument("--frame-candidate-limit", type=int)
     parser.add_argument("--min-filtered-frames", default=1, type=int)
+    parser.add_argument(
+        "--frame-selection",
+        choices=("evenly_spaced", "top_score", "score_diverse", "quality_weighted"),
+        default="evenly_spaced",
+        help="How to choose max-frames from the available filtered frames.",
+    )
+    parser.add_argument("--frame-score-power", default=2.0, type=float)
+    parser.add_argument("--frame-score-floor", default=0.05, type=float)
     parser.add_argument("--anchor-model", type=Path)
     parser.add_argument("--anchor-schema", type=Path)
     parser.add_argument("--anchor-feature-name", default="roi_anchor_prediction")

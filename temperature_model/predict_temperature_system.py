@@ -20,7 +20,7 @@ import torch
 
 from train_thermal_feature_fusion_cnn import (
     ThermalFeatureFusionRegressor,
-    choose_evenly_spaced,
+    choose_frame_subset,
     filter_frames_for_key,
     index_raw_zip,
     normalize_frame,
@@ -59,9 +59,11 @@ def load_raw_frame_tensor(raw_zip: Path, date: str, sequence_num: str, model_arg
     if not frames:
         raise RuntimeError(f"No raw TIFF frames found for {date}/{sequence_num}")
 
+    frame_scores = {}
     frame_filter_csv = model_args.get("frame_filter_csv")
     if frame_filter_csv and str(frame_filter_csv) != "None":
         frame_filter = read_frame_filter(Path(frame_filter_csv), str(model_args.get("frame_score_column", "frontal_score")))
+        frame_scores = dict(frame_filter.get((date, sequence_num), []))
         candidate_limit = model_args.get("frame_candidate_limit")
         candidate_limit = int(candidate_limit) if candidate_limit not in {None, "None"} else None
         filtered_frames = filter_frames_for_key(frames, date, sequence_num, frame_filter, candidate_limit)
@@ -74,7 +76,14 @@ def load_raw_frame_tensor(raw_zip: Path, date: str, sequence_num: str, model_arg
     thermal_min = float(model_args.get("thermal_min", 15.0))
     thermal_max = float(model_args.get("thermal_max", 45.0))
 
-    selected = choose_evenly_spaced(frames, max_frames)
+    selected = choose_frame_subset(
+        frames,
+        max_frames,
+        score_lookup=frame_scores,
+        selection=str(model_args.get("frame_selection", "evenly_spaced")),
+        score_power=float(model_args.get("frame_score_power", 2.0)),
+        score_floor=float(model_args.get("frame_score_floor", 0.05)),
+    )
     arrays = []
     with zipfile.ZipFile(raw_zip) as zf:
         for _, zip_name in selected:

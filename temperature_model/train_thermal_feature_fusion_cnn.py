@@ -71,6 +71,103 @@ def choose_evenly_spaced(items, max_items):
     return [items[int(pos)] for pos in positions]
 
 
+def choose_top_scored(items, max_items, score_lookup):
+    if len(items) <= max_items:
+        return items
+    ranked = sorted(
+        items,
+        key=lambda item: (score_lookup.get(item[0], 0.0), item[0]),
+        reverse=True,
+    )[:max_items]
+    return sorted(ranked, key=lambda item: item[0])
+
+
+def choose_score_diverse(items, max_items, score_lookup):
+    if len(items) <= max_items:
+        return items
+    boundaries = np.linspace(0, len(items), max_items + 1).round().astype(int)
+    chosen_indices = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        if end <= start:
+            continue
+        segment_indices = list(range(int(start), int(end)))
+        midpoint = (start + end - 1) / 2.0
+        best_idx = max(
+            segment_indices,
+            key=lambda idx: (
+                score_lookup.get(items[idx][0], 0.0),
+                -abs(idx - midpoint),
+                -idx,
+            ),
+        )
+        chosen_indices.append(best_idx)
+
+    chosen = set(chosen_indices)
+    if len(chosen) < max_items:
+        remaining = [idx for idx in range(len(items)) if idx not in chosen]
+        remaining.sort(
+            key=lambda idx: (score_lookup.get(items[idx][0], 0.0), -abs(idx - len(items) / 2.0)),
+            reverse=True,
+        )
+        chosen.update(remaining[: max_items - len(chosen)])
+    return [items[idx] for idx in sorted(chosen)[:max_items]]
+
+
+def choose_quality_weighted(items, max_items, score_lookup, score_power=2.0, score_floor=0.05):
+    if len(items) <= max_items:
+        return items
+    scores = np.asarray(
+        [max(float(score_lookup.get(frame_id, 0.0)), score_floor) for frame_id, _ in items],
+        dtype=np.float32,
+    )
+    scores = np.where(np.isfinite(scores), scores, score_floor)
+    weights = np.power(np.clip(scores, score_floor, None), score_power)
+    total = float(np.sum(weights))
+    if total <= 1e-9:
+        return choose_evenly_spaced(items, max_items)
+
+    cumulative = np.cumsum(weights) / total
+    targets = np.linspace(0.0, 1.0, max_items + 2, dtype=np.float32)[1:-1]
+    chosen = []
+    used = set()
+    for target in targets:
+        idx = int(np.searchsorted(cumulative, target, side="left"))
+        idx = max(0, min(len(items) - 1, idx))
+        if idx in used:
+            candidates = [candidate for candidate in range(len(items)) if candidate not in used]
+            if not candidates:
+                break
+            idx = min(candidates, key=lambda candidate: (abs(candidate - idx), -weights[candidate]))
+        used.add(idx)
+        chosen.append(idx)
+
+    if len(chosen) < max_items:
+        remaining = [idx for idx in range(len(items)) if idx not in used]
+        remaining.sort(key=lambda idx: (weights[idx], scores[idx]), reverse=True)
+        chosen.extend(remaining[: max_items - len(chosen)])
+    return [items[idx] for idx in sorted(chosen)[:max_items]]
+
+
+def choose_frame_subset(
+    items,
+    max_items,
+    score_lookup=None,
+    selection="evenly_spaced",
+    score_power=2.0,
+    score_floor=0.05,
+):
+    score_lookup = score_lookup or {}
+    if selection == "evenly_spaced" or not score_lookup:
+        return choose_evenly_spaced(items, max_items)
+    if selection == "top_score":
+        return choose_top_scored(items, max_items, score_lookup)
+    if selection == "score_diverse":
+        return choose_score_diverse(items, max_items, score_lookup)
+    if selection == "quality_weighted":
+        return choose_quality_weighted(items, max_items, score_lookup, score_power, score_floor)
+    raise ValueError(f"Unknown frame selection mode: {selection}")
+
+
 def read_tiff_array(zf, name):
     with zf.open(name) as f:
         data = f.read()
@@ -277,6 +374,10 @@ class FusionDataset:
         normalize,
         thermal_min,
         thermal_max,
+        frame_scores=None,
+        frame_selection="evenly_spaced",
+        frame_score_power=2.0,
+        frame_score_floor=0.05,
     ):
         self.samples = samples
         self.raw_zip = raw_zip
@@ -290,6 +391,10 @@ class FusionDataset:
         self.normalize = normalize
         self.thermal_min = thermal_min
         self.thermal_max = thermal_max
+        self.frame_scores = frame_scores or {}
+        self.frame_selection = frame_selection
+        self.frame_score_power = frame_score_power
+        self.frame_score_floor = frame_score_floor
         self.frame_cache = self._preload_frames()
         self.feature_cache = self._preload_features()
 
@@ -297,7 +402,15 @@ class FusionDataset:
         return len(self.samples)
 
     def _load_sample_frames(self, sample):
-        chosen = choose_evenly_spaced(sample.frames, self.max_frames)
+        score_lookup = dict(self.frame_scores.get((sample.date, sample.sequence_num), []))
+        chosen = choose_frame_subset(
+            sample.frames,
+            self.max_frames,
+            score_lookup=score_lookup,
+            selection=self.frame_selection,
+            score_power=self.frame_score_power,
+            score_floor=self.frame_score_floor,
+        )
         frames = []
         with zipfile.ZipFile(self.raw_zip) as zf:
             for _, zip_name in chosen:
@@ -419,6 +532,10 @@ def train_once(args, train_samples, test_samples, feature_rows, feature_names):
     from torch.utils.data import DataLoader
 
     feature_median, feature_mean, feature_std = build_feature_stats(train_samples, feature_rows, feature_names)
+    frame_scores = {}
+    frame_filter_csv = getattr(args, "frame_filter_csv", None)
+    if frame_filter_csv:
+        frame_scores = read_frame_filter(Path(frame_filter_csv), getattr(args, "frame_score_column", "frontal_score"))
     train_ds = FusionDataset(
         train_samples,
         args.raw_zip,
@@ -432,6 +549,10 @@ def train_once(args, train_samples, test_samples, feature_rows, feature_names):
         args.normalize,
         args.thermal_min,
         args.thermal_max,
+        frame_scores=frame_scores,
+        frame_selection=getattr(args, "frame_selection", "evenly_spaced"),
+        frame_score_power=getattr(args, "frame_score_power", 2.0),
+        frame_score_floor=getattr(args, "frame_score_floor", 0.05),
     )
     test_ds = FusionDataset(
         test_samples,
@@ -446,6 +567,10 @@ def train_once(args, train_samples, test_samples, feature_rows, feature_names):
         args.normalize,
         args.thermal_min,
         args.thermal_max,
+        frame_scores=frame_scores,
+        frame_selection=getattr(args, "frame_selection", "evenly_spaced"),
+        frame_score_power=getattr(args, "frame_score_power", 2.0),
+        frame_score_floor=getattr(args, "frame_score_floor", 0.05),
     )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
@@ -511,6 +636,14 @@ def main():
     parser.add_argument("--frame-score-column", default="frontal_score")
     parser.add_argument("--frame-candidate-limit", type=int)
     parser.add_argument("--min-filtered-frames", default=1, type=int)
+    parser.add_argument(
+        "--frame-selection",
+        choices=("evenly_spaced", "top_score", "score_diverse", "quality_weighted"),
+        default="evenly_spaced",
+        help="How to choose max-frames from the available filtered frames.",
+    )
+    parser.add_argument("--frame-score-power", default=2.0, type=float)
+    parser.add_argument("--frame-score-floor", default=0.05, type=float)
     parser.add_argument("--anchor-model", type=Path)
     parser.add_argument("--anchor-schema", type=Path)
     parser.add_argument("--anchor-feature-name", default="roi_anchor_prediction")
